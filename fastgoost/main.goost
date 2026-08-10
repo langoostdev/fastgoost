@@ -1,0 +1,1505 @@
+// fastgoost — a declarative web framework for Langoost.
+//
+//   import { newApp } from "fastgoost"
+//
+//   let app = newApp({title: "Example", version: "1.0.0"})
+//
+//   app.get("/hello/{name}", fn(req) {
+//       return {greeting: "hello " + req.params.name}
+//   })
+//
+//   app.run(8080)
+//
+// Returning an object or an array sends JSON. Returning a string sends text.
+// Returning one of the response helpers — json, text, html, redirect, file —
+// sends exactly what you asked for. Throwing an HTTP error sends that status.
+//
+// A route may declare what it accepts, and one declaration does three jobs:
+// it validates the request, it documents the endpoint at /docs, and it hands
+// the handler typed values instead of strings.
+//
+//   app.post("/items", {
+//       handler: createItem,
+//       summary: "Create an item",
+//       tags:    ["items"],
+//       status:  201,
+//       body:    {title: {kind: "string", minLength: 1},
+//                 done:  {kind: "bool", default: false}},
+//   })
+//
+// This file is the public API. The rest of the package is machinery:
+//
+//   httpx.goost      status phrases, MIME types, headers, cookies, queries
+//   routing.goost    compiling, scoring and matching path patterns
+//   validate.goost   schemas, coercion, constraints
+//   ws.goost         RFC 6455 framing, server side
+//   server.goost     the HTTP/1.1 connection loop on raw sockets
+//   openapi.goost    spec generation and the documentation UIs
+//
+// See README.md for the tour and docs/guide.md for the whole story.
+
+import strings
+import io
+import time
+import os
+import form
+import { parse, stringify } from "json"
+
+import { compile, match } from "./routing.goost"
+import { validateSchema } from "./validate.goost"
+import { listen, hijacked, sendRaw, spawn } from "./server.goost"
+import { document, swaggerHtml, redocHtml } from "./openapi.goost"
+import { wsIsUpgrade, wsHandshake, wsRecv, wsSend, wsSendBinary, wsClose } from "./ws.goost"
+import { statusText, mimeType, contentTypeBase } from "./httpx.goost"
+import { parseQuery, parseCookieHeader, setCookieLine } from "./httpx.goost"
+import { normalisePath, joinPath } from "./httpx.goost"
+import { isCallable, contains, concat, VERSION } from "./support.goost"
+import { show } from "./banner.goost"
+
+// Anything that knows how to become a response satisfies this. Your own
+// classes can too — give one an intoResponse() and return it from a handler
+// like any built-in.
+interface Responder {
+    fn intoResponse()
+}
+
+// ── Response ───────────────────────────────────────────────────────────────
+
+// Response is the explicit form of a reply: a status, header lines and a body.
+// Build one with the helpers below rather than by hand — they set the
+// Content-Type you meant.
+class Response {
+    fn intoResponse() { return self }
+
+    // header appends a header line. Repeating a name repeats the line, which
+    // is what Set-Cookie and Vary need.
+    fn header(name: string, value: string) {
+        self.rawHeaders = append(self.rawHeaders, name + ": " + value)
+        return self
+    }
+
+    // contentType overrides the media type chosen by the helper.
+    fn contentType(value: string) {
+        let kept = []
+        for line in self.rawHeaders {
+            if !strings.hasPrefix(strings.lower(line), "content-type:") {
+                kept = append(kept, line)
+            }
+        }
+        self.rawHeaders = append(kept, "Content-Type: " + value)
+        return self
+    }
+
+    // cookie sets one with the safe defaults: Path=/, HttpOnly, SameSite=Lax.
+    fn cookie(name: string, value: string) {
+        return self.header("Set-Cookie", setCookieLine(name, value, {}))
+    }
+
+    // cookieWith sets one with options — maxAge, secure, sameSite, domain,
+    // path, httpOnly. Two methods rather than one optional argument because
+    // a Langoost method cannot take a variadic parameter.
+    fn cookieWith(name: string, value: string, options: object) {
+        return self.header("Set-Cookie", setCookieLine(name, value, options))
+    }
+
+    // clearCookie expires one immediately.
+    fn clearCookie(name: string) {
+        return self.header("Set-Cookie", setCookieLine(name, "", {maxAge: 0}))
+    }
+
+    // withStatus changes the status code, for reusing a built response.
+    fn withStatus(code: int) {
+        self.status = code
+        return self
+    }
+}
+
+// makeResponse is the one place a Response is constructed, so every one of
+// them has the fields the writer expects.
+fn makeResponse(status: int, contentType: string, body: string): Response {
+    let headers = []
+    if contentType != "" { headers = append(headers, "Content-Type: " + contentType) }
+    return Response{status: status, rawHeaders: headers, body: body}
+}
+
+// json sends a JSON body. The second argument, if given, is the status code
+// or an options object: json(item, 201), json(item, {status: 201}).
+fn json(data, ...opts): Response {
+    return makeResponse(statusFrom(opts, 200), "application/json", stringify(data))
+}
+
+// text sends text/plain.
+fn text(body: string, ...opts): Response {
+    return makeResponse(statusFrom(opts, 200), "text/plain; charset=utf-8", body)
+}
+
+// html sends text/html.
+fn html(body: string, ...opts): Response {
+    return makeResponse(statusFrom(opts, 200), "text/html; charset=utf-8", body)
+}
+
+// redirect sends a Location header. Defaults to 302; pass 301 for permanent,
+// 303 to turn a POST into a GET.
+fn redirect(location: string, ...opts): Response {
+    let resp = makeResponse(statusFrom(opts, 302), "", "")
+    return resp.header("Location", location)
+}
+
+// noContent sends 204 with no body.
+fn noContent(): Response {
+    return makeResponse(204, "", "")
+}
+
+// file sends a file from disk, with a Content-Type guessed from its name.
+// Throws a 404 error when the file is not there, so it composes with the
+// framework's error handling rather than needing its own.
+fn file(path: string, ...opts): Response {
+    if !io.exists(path) {
+        throw httpError(404, "not found")
+    }
+    let body = ""
+    try {
+        body = io.read(path)
+    } catch e {
+        throw httpError(500, "cannot read file")
+    }
+    return makeResponse(statusFrom(opts, 200), mimeType(path), body)
+}
+
+// raw builds a response with headers given as an object or as raw lines.
+fn raw(status: int, headers, body: string): Response {
+    let resp = Response{status: status, rawHeaders: [], body: body}
+    if typeof(headers) == "object" {
+        for name in headers { resp = resp.header(name, toString(headers[name])) }
+    } else if typeof(headers) == "array" {
+        for line in headers { resp.rawHeaders = append(resp.rawHeaders, line) }
+    }
+    return resp
+}
+
+// statusFrom reads the optional trailing argument shared by the helpers:
+// either a bare status code or an object carrying one.
+fn statusFrom(opts, fallback: int): int {
+    if len(opts) == 0 { return fallback }
+    let first = opts[0]
+    if typeof(first) == "int" { return first }
+    if typeof(first) == "object" && typeof(first.status) == "int" { return first.status }
+    return fallback
+}
+
+// ── Schema shorthands ──────────────────────────────────────────────────────
+
+// Spec objects are plain data, so a schema can always be written by hand:
+//
+//   {title: {kind: "string", minLength: 2}}
+//
+// These build the same objects with less punctuation, which is what lets a
+// declared route stay on one line:
+//
+//   let ItemBody = {title: Str({minLength: 2}), done: Bool({default: false})}
+//   app.post("/items", {handler: createItem, body: ItemBody, status: 201})
+//
+// They are capitalised because `int`, `float`, `string` and `bool` are
+// reserved words in Langoost and cannot be function names.
+
+// Str declares a string field. Options: minLength, maxLength, pattern, enum,
+// default, required, description, example.
+fn Str(...opts): object { return spec("string", opts) }
+
+// Int declares an integer field. Options: min, max, enum, default, required.
+fn Int(...opts): object { return spec("int", opts) }
+
+// Num declares a floating-point field. Same options as Int.
+fn Num(...opts): object { return spec("float", opts) }
+
+// Bool declares a boolean field.
+fn Bool(...opts): object { return spec("bool", opts) }
+
+// Any declares a field that is passed through unchecked.
+fn Any(...opts): object { return spec("any", opts) }
+
+// List declares an array field whose elements match `items`.
+//
+//   tags: List(Str(), {default: []})
+fn List(items, ...opts): object {
+    let out = spec("array", opts)
+    out.items = items
+    return out
+}
+
+// Obj declares a nested object field whose keys match `fields`.
+//
+//   author: Obj({name: Str(), email: Str({required: false})})
+fn Obj(fields, ...opts): object {
+    let out = spec("object", opts)
+    out.fields = fields
+    return out
+}
+
+fn spec(kind: string, opts): object {
+    let out = {kind: kind}
+    if len(opts) > 0 && typeof(opts[0]) == "object" {
+        for key in opts[0] { out[key] = opts[0][key] }
+    }
+    return out
+}
+
+// ── Errors ─────────────────────────────────────────────────────────────────
+
+// httpError builds the value a handler throws to answer with a status code.
+// The detail may be a string or any JSON-serialisable value.
+fn httpError(status: int, ...detail): object {
+    let body = statusText(status)
+    if len(detail) > 0 && typeof(detail[0]) != "void" && detail[0] != "" { body = detail[0] }
+    let headers = {}
+    if len(detail) > 1 && typeof(detail[1]) == "object" { headers = detail[1] }
+    return {kind: "HTTPError", status: status, detail: body, headers: headers}
+}
+
+// abort throws one. `abort(404)` and `abort(403, "not your item")` are the
+// two forms you will actually write.
+fn abort(status: int, ...detail) {
+    if len(detail) > 0 {
+        throw httpError(status, detail[0])
+    }
+    throw httpError(status)
+}
+
+fn isHTTPError(value): bool {
+    return typeof(value) == "object" && value.kind == "HTTPError"
+}
+
+// ── res: the reply builder ─────────────────────────────────────────────────
+
+// `res` is the object form of the response helpers. Both spellings build the
+// same Response; use whichever reads better at the call site:
+//
+//   return json(item, 201)
+//   return res.status(201).json(item)
+//
+// The object form is the one that composes. Because a Langoost method cannot
+// take an optional argument, `json(item, 201)` can carry a status but
+// `resp.header(…)` cannot be threaded into it — so anything with a status, a
+// header and a cookie on it wants the chain:
+//
+//   return res.status(201)
+//             .header("Location", "/items/" + id)
+//             .cookie("last_seen", id)
+//             .json(item)
+//
+// Every method returns a *new* Reply rather than mutating the receiver. The
+// exported `res` is one shared object and request threads run concurrently;
+// a builder that mutated itself would leak one request's headers into
+// another's response.
+class Reply {
+    // status sets the code the eventual response carries.
+    fn status(code: int): Reply {
+        return Reply{code: code, lines: self.lines}
+    }
+
+    // header adds a header line. Repeating a name repeats the line.
+    fn header(name: string, value: string): Reply {
+        return Reply{code: self.code, lines: append(self.lines, name + ": " + value)}
+    }
+
+    // contentType overrides the media type the body method would choose.
+    fn contentType(value: string): Reply {
+        return self.header("Content-Type", value)
+    }
+
+    // cookie sets one with the safe defaults: Path=/, HttpOnly, SameSite=Lax.
+    fn cookie(name: string, value: string): Reply {
+        return self.header("Set-Cookie", setCookieLine(name, value, {}))
+    }
+
+    // cookieWith sets one with options — maxAge, secure, sameSite, domain,
+    // path, httpOnly.
+    fn cookieWith(name: string, value: string, options: object): Reply {
+        return self.header("Set-Cookie", setCookieLine(name, value, options))
+    }
+
+    // clearCookie expires one immediately.
+    fn clearCookie(name: string): Reply {
+        return self.header("Set-Cookie", setCookieLine(name, "", {maxAge: 0}))
+    }
+
+    // json sends a JSON body.
+    fn json(data): Response {
+        return self.finish(200, "application/json", stringify(data))
+    }
+
+    // text sends text/plain.
+    fn text(body: string): Response {
+        return self.finish(200, "text/plain; charset=utf-8", body)
+    }
+
+    // html sends text/html.
+    fn html(body: string): Response {
+        return self.finish(200, "text/html; charset=utf-8", body)
+    }
+
+    // file sends a file from disk, typed by its extension. Throws 404 when it
+    // is not there.
+    fn file(path: string): Response {
+        if !io.exists(path) { throw httpError(404, "not found") }
+        let body = ""
+        try {
+            body = io.read(path)
+        } catch e {
+            throw httpError(500, "cannot read file")
+        }
+        return self.finish(200, mimeType(path), body)
+    }
+
+    // redirect sends a Location header, 302 unless a status was set.
+    fn redirect(location: string): Response {
+        let resp = self.finish(302, "", "")
+        return resp.header("Location", location)
+    }
+
+    // noContent sends 204 and nothing else.
+    fn noContent(): Response {
+        return self.finish(204, "", "")
+    }
+
+    // body sends bytes with no Content-Type of its own — set one with
+    // contentType() first, or let the client sniff.
+    fn body(payload: string): Response {
+        return self.finish(200, "", payload)
+    }
+
+    // finish assembles the Response. The body method supplies the status and
+    // content type it would use by default; an explicit status() wins, and an
+    // explicit Content-Type header wins over the default one.
+    fn finish(defaultStatus: int, contentType: string, payload: string): Response {
+        let status = defaultStatus
+        if typeof(self.code) == "int" && self.code != 0 { status = self.code }
+
+        let headers = []
+        let hasType = false
+        for line in self.lines {
+            if strings.hasPrefix(strings.lower(line), "content-type:") { hasType = true }
+            headers = append(headers, line)
+        }
+        if contentType != "" && !hasType {
+            headers = append(headers, "Content-Type: " + contentType)
+        }
+        return Response{status: status, rawHeaders: headers, body: payload}
+    }
+}
+
+// res is the shared, empty builder every chain starts from.
+let res = Reply{code: 0, lines: []}
+
+// ── err: the error builder ─────────────────────────────────────────────────
+
+// `err` names the statuses worth naming, so a rejection reads as what it is:
+//
+//   throw err.notFound("no user " + id)
+//   throw err.forbidden("not your item")
+//
+// Each returns the error value; `throw` stays visible at the call site rather
+// than hiding a non-local exit inside a helper. Every one takes a detail,
+// because a Langoost method cannot have an optional argument — pass "" for
+// the status code's own phrase, or use abort(403), which takes the detail as
+// an optional argument and throws for you.
+class Errors {
+    fn badRequest(detail): object   { return httpError(400, detail) }
+    fn unauthorized(detail): object { return httpError(401, detail) }
+    fn forbidden(detail): object    { return httpError(403, detail) }
+    fn notFound(detail): object     { return httpError(404, detail) }
+    fn notAllowed(detail): object   { return httpError(405, detail) }
+    fn conflict(detail): object     { return httpError(409, detail) }
+    fn gone(detail): object         { return httpError(410, detail) }
+    fn tooLarge(detail): object     { return httpError(413, detail) }
+    fn unsupported(detail): object  { return httpError(415, detail) }
+    fn invalid(detail): object      { return httpError(422, detail) }
+    fn tooMany(detail): object      { return httpError(429, detail) }
+    fn internal(detail): object     { return httpError(500, detail) }
+    fn unavailable(detail): object  { return httpError(503, detail) }
+
+    // status is the general form, for a code with no name here.
+    fn status(code: int, detail): object { return httpError(code, detail) }
+
+    // withHeaders attaches headers to an error — a WWW-Authenticate challenge
+    // on a 401, a Retry-After on a 429.
+    fn withHeaders(error: object, headers: object): object {
+        error.headers = headers
+        return error
+    }
+}
+
+// err is the shared error builder.
+let err = Errors{}
+
+// ── Request ────────────────────────────────────────────────────────────────
+
+// Request is what a handler receives. The fields carry the request; the
+// methods are conveniences over them.
+//
+//   method, path, rawQuery, version   the request line
+//   headers                           lowercased name → value
+//   params                            path parameters, converted
+//   query                             query parameters, validated if declared
+//   data                              request body, validated if declared
+//   body                              the raw body, as sent
+//   state                             yours; middleware writes here
+//   deps                              resolved dependencies
+//   app                               the application
+//   remoteAddr                        peer address, as seen by the socket
+class Request {
+    // header reads one request header, case-insensitively. Absent is "".
+    fn header(name: string): string {
+        let value = self.headers[strings.lower(name)]
+        if typeof(value) != "string" { return "" }
+        return value
+    }
+
+    // cookies parses the Cookie header into an object, once per request.
+    fn cookies(): object {
+        if typeof(self.cookieJar) == "object" { return self.cookieJar }
+        self.cookieJar = parseCookieHeader(self.header("Cookie"))
+        return self.cookieJar
+    }
+
+    // cookie reads one cookie. Absent is "".
+    fn cookie(name: string): string {
+        let jar = self.cookies()
+        let value = jar[name]
+        if typeof(value) != "string" { return "" }
+        return value
+    }
+
+    // bearer extracts a Bearer token from the Authorization header, or "".
+    fn bearer(): string {
+        let auth = self.header("Authorization")
+        if !strings.hasPrefix(strings.lower(auth), "bearer ") { return "" }
+        return strings.trim(strings.slice(auth, 7, len(auth)))
+    }
+
+    // contentType is the media type of the body, without parameters.
+    fn contentType(): string {
+        return contentTypeBase(self.header("Content-Type"))
+    }
+
+    // json parses the body as JSON. Throws a 400 when it is not, so a
+    // malformed body answers with a status rather than a stack trace.
+    fn json() {
+        if self.body == "" { return }
+        try {
+            return parse(self.body)
+        } catch e {
+            throw httpError(400, "request body is not valid JSON")
+        }
+    }
+
+    // form parses an HTML form body, url-encoded or multipart, into
+    // {fields, files}. Throws a 400 on a body that is neither.
+    fn form(): object {
+        let kind = self.contentType()
+        try {
+            if kind == "application/x-www-form-urlencoded" {
+                return form.parseURLEncoded(self.body)
+            }
+            if kind == "multipart/form-data" {
+                return form.parseMultipart(self.body, self.header("Content-Type"))
+            }
+        } catch e {
+            throw httpError(400, "cannot parse form body")
+        }
+        throw httpError(415, "expected a form body")
+    }
+
+    // q reads one query parameter. Absent is "".
+    fn q(name: string) {
+        let value = self.query[name]
+        if typeof(value) == "void" { return "" }
+        return value
+    }
+
+    // qOr reads one query parameter, falling back when it is absent.
+    fn qOr(name: string, fallback) {
+        let value = self.query[name]
+        if typeof(value) == "void" { return fallback }
+        return value
+    }
+
+    // param reads one path parameter.
+    fn param(name: string) {
+        return self.params[name]
+    }
+
+    // url is the path with the query string, as it arrived.
+    fn url(): string {
+        if self.rawQuery == "" { return self.path }
+        return self.path + "?" + self.rawQuery
+    }
+
+    // accepts reports whether the client said it would take this media type.
+    // A missing Accept header means anything, which is what the RFC says.
+    fn accepts(mediaType: string): bool {
+        let header = strings.lower(self.header("Accept"))
+        if header == "" { return true }
+        if strings.contains(header, "*/*") { return true }
+        return strings.contains(header, strings.lower(mediaType))
+    }
+
+    // isSecure reports whether a proxy in front said the original request
+    // arrived over TLS. fastgoost itself never terminates TLS.
+    fn isSecure(): bool {
+        return strings.lower(self.header("X-Forwarded-Proto")) == "https"
+    }
+
+    // clientIp prefers the left-most X-Forwarded-For entry, falling back to
+    // the socket's peer address. Trust it only behind a proxy you control —
+    // a client can send that header itself.
+    fn clientIp(): string {
+        let forwarded = self.header("X-Forwarded-For")
+        if forwarded != "" {
+            let parts = strings.split(forwarded, ",")
+            return strings.trim(parts[0])
+        }
+        let addr = self.remoteAddr
+        if typeof(addr) != "string" || addr == "" { return "" }
+        let colon = strings.lastIndexOf(addr, ":")
+        if colon > 0 { addr = strings.slice(addr, 0, colon) }
+        // An IPv6 peer arrives as "[::1]:52000"; the brackets are the address
+        // format's, not part of the address.
+        if strings.hasPrefix(addr, "[") && strings.hasSuffix(addr, "]") {
+            addr = strings.slice(addr, 1, len(addr) - 1)
+        }
+        return addr
+    }
+}
+
+// ── Streams ────────────────────────────────────────────────────────────────
+
+// Stream is the handler argument for a Server-Sent Events route. The
+// connection stays open for as long as the handler runs.
+class Stream {
+    // send emits a named event. The data is sent verbatim; pass a string.
+    fn send(event: string, data: string) {
+        return self.write(frame(event, data, ""))
+    }
+
+    // sendJson emits a named event carrying a JSON payload.
+    fn sendJson(event: string, data) {
+        return self.write(frame(event, stringify(data), ""))
+    }
+
+    // sendId emits a named event with an id, so a reconnecting client can
+    // resume with Last-Event-ID.
+    fn sendId(event: string, data: string, id: string) {
+        return self.write(frame(event, data, id))
+    }
+
+    // data emits an unnamed event — what EventSource.onmessage receives.
+    fn data(payload: string) {
+        return self.write(frame("", payload, ""))
+    }
+
+    // comment sends a no-op line. Browsers ignore it; proxies see traffic,
+    // which is what keeps an idle stream from being reaped.
+    fn comment(note: string) {
+        return self.write(": " + note + "\n\n")
+    }
+
+    // retry tells the client how long to wait before reconnecting.
+    fn retry(ms: int) {
+        return self.write("retry: " + toString(ms) + "\n\n")
+    }
+
+    // write puts raw bytes on the wire and tracks whether the peer is still
+    // there. Once alive goes false, every further write is a no-op.
+    fn write(payload: string): bool {
+        if !self.alive { return false }
+        if !sendRaw(self.conn, payload) {
+            self.alive = false
+            return false
+        }
+        return true
+    }
+
+    // lastEventId is what the client sent when reconnecting, or "".
+    fn lastEventId(): string {
+        return self.req.header("Last-Event-ID")
+    }
+}
+
+// frame formats one SSE event. Multi-line data becomes several data: lines,
+// which is how the wire format carries a newline.
+fn frame(event: string, data: string, id: string): string {
+    let out = ""
+    if id != "" { out = out + "id: " + id + "\n" }
+    if event != "" { out = out + "event: " + event + "\n" }
+    for line in strings.split(data, "\n") {
+        out = out + "data: " + line + "\n"
+    }
+    return out + "\n"
+}
+
+// Socket is the handler argument for a WebSocket route, wrapping the raw
+// connection so a handler never touches the `websocket` module directly.
+class Socket {
+    // recv reads one message, or returns void when the peer closes. The
+    // idiomatic loop is `while true { let msg = ws.recv(); if typeof(msg) == "void" { break } }`.
+    fn recv() {
+        return wsRecv(self.conn)
+    }
+
+    // send sends a text message.
+    fn send(message: string): bool {
+        return wsSend(self.conn, message)
+    }
+
+    // sendJson sends a JSON-encoded text message.
+    fn sendJson(data): bool {
+        return wsSend(self.conn, stringify(data))
+    }
+
+    // sendBinary sends a binary message.
+    fn sendBinary(data): bool {
+        return wsSendBinary(self.conn, data)
+    }
+
+    // close ends the connection.
+    fn close() {
+        return wsClose(self.conn)
+    }
+}
+
+// ── Router ─────────────────────────────────────────────────────────────────
+
+// Router groups routes under a shared prefix, with middleware and tags that
+// apply to all of them. An App is a Router, so everything here works on both.
+class App {
+    // Each of these takes a path and either a bare handler or a route spec:
+    //
+    //   app.get("/items", listItems)
+    //
+    //   app.get("/items", {
+    //       handler: listItems,
+    //       summary: "List items",
+    //       query:   {limit: {kind: "int", default: 20, max: 100}},
+    //   })
+    //
+    // One argument doing two jobs, rather than an optional third, because a
+    // Langoost method cannot take a variadic parameter — passing one silently
+    // binds it as an ordinary argument and the arity check then rejects the
+    // short call.
+    fn get(path: string, spec)     { return self.route("GET", path, spec) }
+    fn post(path: string, spec)    { return self.route("POST", path, spec) }
+    fn put(path: string, spec)     { return self.route("PUT", path, spec) }
+    fn patch(path: string, spec)   { return self.route("PATCH", path, spec) }
+    fn delete(path: string, spec)  { return self.route("DELETE", path, spec) }
+    fn options(path: string, spec) { return self.route("OPTIONS", path, spec) }
+    fn head(path: string, spec)    { return self.route("HEAD", path, spec) }
+
+    // route is the same thing with the method as data, for a table-driven
+    // route list or a method this class does not name.
+    fn route(method: string, path: string, spec) {
+        let parsed = routeSpec(spec)
+        return self.add(strings.upper(method), path, parsed.handler, parsed.options)
+    }
+
+    // all registers one handler for every common method.
+    fn all(path: string, spec) {
+        let parsed = routeSpec(spec)
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] {
+            self.add(method, path, parsed.handler, parsed.options)
+        }
+        return self
+    }
+
+    // add is the lowest form: an explicit method, handler and options object.
+    fn add(method: string, path: string, handler, options) {
+        if !isCallable(handler) {
+            throw {kind: "RouteError", message: "route " + method + " " + path + ": handler must be a function"}
+        }
+        self.routes = append(self.routes, makeRoute(strings.upper(method), joinPath(self.prefix, path), handler, options, self.tags, "http"))
+        return self
+    }
+
+    // use adds middleware. Middleware is `fn(req, next)`; call next(req) to
+    // continue down the chain and return a response, or return one of your
+    // own to stop. On a Router, it applies to that router's routes only.
+    fn use(middleware) {
+        if !isCallable(middleware) {
+            throw {kind: "RouteError", message: "use() expects a function of (req, next)"}
+        }
+        self.middleware = append(self.middleware, middleware)
+        return self
+    }
+
+    // include mounts another router's routes under this one, keeping the
+    // sub-router's own prefix and folding its middleware into each route.
+    fn include(router) {
+        return self.mount("", router)
+    }
+
+    // mount is include with an extra path prefix.
+    fn mount(prefix: string, router) {
+        for route in router.routes {
+            let copy = cloneRoute(route)
+            copy.pattern = joinPath(self.prefix, joinPath(prefix, route.pattern))
+            copy.compiled = compile(copy.pattern)
+            copy.pathParams = pathParamsOf(copy.compiled)
+            copy.middleware = concat(router.middleware, route.middleware)
+            self.routes = append(self.routes, copy)
+        }
+        return self
+    }
+
+    // sse registers a Server-Sent Events endpoint. The handler receives a
+    // Stream and owns the connection until it returns.
+    fn sse(path: string, spec) {
+        let parsed = routeSpec(spec)
+        self.routes = append(self.routes, makeRoute("GET", joinPath(self.prefix, path), parsed.handler, parsed.options, self.tags, "sse"))
+        return self
+    }
+
+    // ws registers a WebSocket endpoint. The handler receives a Socket and
+    // owns the connection until it returns.
+    fn ws(path: string, spec) {
+        let parsed = routeSpec(spec)
+        self.routes = append(self.routes, makeRoute("GET", joinPath(self.prefix, path), parsed.handler, parsed.options, self.tags, "ws"))
+        return self
+    }
+
+    // static serves a directory. `/assets` + `./public` means a request for
+    // /assets/app.css reads ./public/app.css. Paths are normalised before
+    // they touch the filesystem, so a request cannot climb out of the root.
+    //
+    // The second argument is the directory, or an object: {dir, index (default
+    // "index.html"), cacheControl, fallback (a file to serve when nothing
+    // matches — a single-page app's index.html)}.
+    fn static(urlPrefix: string, spec) {
+        let options = {}
+        let root = ""
+        if typeof(spec) == "string" {
+            root = spec
+        } else if typeof(spec) == "object" && typeof(spec.dir) == "string" {
+            options = spec
+            root = spec.dir
+        } else {
+            throw {kind: "RouteError", message: "static() expects a directory or {dir: \"…\"}"}
+        }
+        let index = "index.html"
+        if typeof(options.index) == "string" { index = options.index }
+        let cacheControl = ""
+        if typeof(options.cacheControl) == "string" { cacheControl = options.cacheControl }
+        let fallback = ""
+        if typeof(options.fallback) == "string" { fallback = options.fallback }
+
+        let handler = fn(req) {
+            let rest = req.params["*"]
+            if typeof(rest) != "string" { rest = "" }
+            let relative = normalisePath("/" + rest)
+            let target = root + relative
+            if io.isDir(target) { target = target + "/" + index }
+            if !io.exists(target) || io.isDir(target) {
+                if fallback == "" { throw httpError(404, "not found") }
+                target = root + "/" + fallback
+                if !io.exists(target) { throw httpError(404, "not found") }
+            }
+            let resp = file(target)
+            if cacheControl != "" { resp = resp.header("Cache-Control", cacheControl) }
+            return resp
+        }
+
+        self.routes = append(self.routes, makeRoute("GET", joinPath(self.prefix, joinPath(urlPrefix, "/*")), handler, {hidden: true}, self.tags, "http"))
+        return self
+    }
+
+    // onStartup registers a function to run once, before the first request.
+    // It receives the app, which is where you open a database or warm a cache.
+    fn onStartup(handler) {
+        self.startupHooks = append(self.startupHooks, handler)
+        return self
+    }
+
+    // onShutdown registers a function to run on SIGINT or SIGTERM.
+    fn onShutdown(handler) {
+        self.shutdownHooks = append(self.shutdownHooks, handler)
+        return self
+    }
+
+    // onError overrides the response for one status code. The handler is
+    // `fn(req, err)` and returns a response like any other.
+    fn onError(status: int, handler) {
+        self.errorHandlers[toString(status)] = handler
+        return self
+    }
+
+    // onException overrides the response for an error that is not an
+    // HTTPError — an unexpected one. The handler is `fn(req, err)`.
+    fn onException(handler) {
+        self.exceptionHandler = handler
+        return self
+    }
+
+    // openapi returns the generated specification as an object.
+    fn openapi(): object {
+        return document(self.info, self.routes)
+    }
+
+    // urlFor builds the path for a named route, substituting parameters.
+    //
+    //   app.get("/users/{id:int}", showUser, {name: "user"})
+    //   app.urlFor("user", {id: 7})        // "/users/7"
+    fn urlFor(name: string, params: object): string {
+        for route in self.routes {
+            if route.name != name { continue }
+            let out = []
+            for segment in strings.split(route.pattern, "/") {
+                if strings.hasPrefix(segment, "{") && strings.hasSuffix(segment, "}") {
+                    let inner = strings.slice(segment, 1, len(segment) - 1)
+                    let colon = strings.indexOf(inner, ":")
+                    if colon >= 0 { inner = strings.slice(inner, 0, colon) }
+                    let value = params[inner]
+                    if typeof(value) == "void" {
+                        throw {kind: "RouteError", message: "urlFor(\"" + name + "\"): missing parameter \"" + inner + "\""}
+                    }
+                    out = append(out, toString(value))
+                } else {
+                    out = append(out, segment)
+                }
+            }
+            let joined = strings.join(out, "/")
+            if joined == "" { return "/" }
+            return joined
+        }
+        throw {kind: "RouteError", message: "urlFor: no route named \"" + name + "\""}
+    }
+
+    // handle runs one request through the whole pipeline and returns a wire
+    // response. Exposed because it is exactly what a test needs: no socket,
+    // no port, just a request in and a response out.
+    fn handle(rawRequest): object {
+        return handleRequest(self, rawRequest)
+    }
+
+    // run starts the server and blocks. The argument is a port, or an object:
+    //
+    //   app.run(8080)
+    //   app.run({port: 8080, host: "127.0.0.1", maxBodyBytes: 1048576})
+    //
+    // Server options: host, port, idleTimeoutMs, headerTimeoutMs,
+    // maxBodyBytes, maxHeaders, keepAlive, serverHeader, banner.
+    fn run(target) {
+        let options = {}
+        let port = 8000
+        if typeof(target) == "int" { port = target }
+        if typeof(target) == "object" { options = target }
+        if typeof(options.port) == "int" { port = options.port }
+
+        let host = "0.0.0.0"
+        if typeof(options.host) == "string" { host = options.host }
+
+        self.installDocs()
+        self.sortRoutes()
+
+        for hook in self.startupHooks {
+            let run = hook
+            run(self)
+        }
+        self.installSignals()
+
+        let banner = true
+        if typeof(options.banner) == "bool" { banner = options.banner }
+
+        let serverOptions = {}
+        for key in options { serverOptions[key] = options[key] }
+        let app = self
+        serverOptions.onReady = fn(boundPort) {
+            if banner { printBanner(app, host, boundPort) }
+        }
+
+        listen(host, port, serverOptions, fn(rawRequest) {
+            return handleRequest(app, rawRequest)
+        })
+    }
+
+    // installDocs adds /openapi.json, /docs and /redoc unless they are
+    // switched off or already taken.
+    fn installDocs() {
+        if self.docsInstalled { return }
+        self.docsInstalled = true
+        if !self.info.docs { return }
+
+        let app = self
+        let specUrl = self.info.openapiUrl
+
+        self.add("GET", specUrl, fn(req) {
+            return json(app.openapi())
+        }, {hidden: true})
+
+        if self.info.docsUrl != "" {
+            self.add("GET", self.info.docsUrl, fn(req) {
+                return html(swaggerHtml(app.info.title, specUrl))
+            }, {hidden: true})
+        }
+        if self.info.redocUrl != "" {
+            self.add("GET", self.info.redocUrl, fn(req) {
+                return html(redocHtml(app.info.title, specUrl))
+            }, {hidden: true})
+        }
+    }
+
+    // sortRoutes puts the most specific patterns first, so /files/latest wins
+    // over /files/{name} whatever order they were registered in. Static
+    // patterns also go into a direct lookup, which is most requests.
+    fn sortRoutes() {
+        let sorted = []
+        for route in self.routes {
+            let index = 0
+            while index < len(sorted) && sorted[index].compiled.score >= route.compiled.score {
+                index += 1
+            }
+            let rebuilt = []
+            let i = 0
+            while i < index {
+                rebuilt = append(rebuilt, sorted[i])
+                i += 1
+            }
+            rebuilt = append(rebuilt, route)
+            while i < len(sorted) {
+                rebuilt = append(rebuilt, sorted[i])
+                i += 1
+            }
+            sorted = rebuilt
+        }
+        self.routes = sorted
+
+        let lookup = {}
+        for route in self.routes {
+            if !route.compiled.static { continue }
+            let key = route.method + " " + route.pattern
+            if typeof(lookup[key]) == "void" { lookup[key] = route }
+        }
+        self.staticRoutes = lookup
+        self.prepared = true
+    }
+
+    // installSignals arranges for the shutdown hooks to run on SIGINT or
+    // SIGTERM.
+    //
+    // Langoost's signal handling is a poll, not a callback: os.signal.notify()
+    // installs the handler and os.signal.trap() reports the last signal seen.
+    // So this spawns a watcher rather than registering anything. The interval
+    // is the delay between Ctrl-C and the process going away, which is why it
+    // is short.
+    //
+    // Signal support is not present in every build, so a failure to install is
+    // not fatal — the hooks simply never run.
+    fn installSignals() {
+        if len(self.shutdownHooks) == 0 { return }
+        let app = self
+        try {
+            os.signal.notify()
+        } catch e {
+            return
+        }
+        spawn(fn() {
+            while true {
+                let caught = os.signal.trap()
+                if caught != "" { runShutdown(app, 130) }
+                time.sleep(150)
+            }
+        })
+    }
+}
+
+// newRouter creates a router: a group of routes under a shared prefix, with
+// its own middleware and tags, meant to be mounted into an application.
+//
+//   let users = newRouter("/users", {tags: ["users"]})
+//   users.get("/{id:int}", showUser)
+//   app.include(users)
+//
+// A router is an App that nobody calls run() on. They are the same class
+// because Langoost resolves an inherited method through the globals of
+// whichever module is *calling*, not the one where the class was declared —
+// so a subclass exported from a library loses its parent's methods the moment
+// somebody imports it. One class, no inheritance, no surprise.
+fn newRouter(...args): App {
+    let prefix = ""
+    let options = {}
+    if len(args) > 0 && typeof(args[0]) == "string" { prefix = args[0] }
+    if len(args) > 0 && typeof(args[0]) == "object" { options = args[0] }
+    if len(args) > 1 && typeof(args[1]) == "object" { options = args[1] }
+
+    let router = newApp(options)
+    router.prefix = normalisePrefix(prefix)
+    router.info.docs = false
+    return router
+}
+
+fn normalisePrefix(prefix: string): string {
+    if prefix == "" || prefix == "/" { return "" }
+    let out = prefix
+    if !strings.hasPrefix(out, "/") { out = "/" + out }
+    if strings.hasSuffix(out, "/") { out = strings.slice(out, 0, len(out) - 1) }
+    return out
+}
+
+// ── Routes ─────────────────────────────────────────────────────────────────
+
+fn makeRoute(method: string, pattern: string, handler, options, inheritedTags, protocol: string): object {
+    let compiled = compile(pattern)
+
+    let tags = inheritedTags
+    if typeof(options.tags) == "array" { tags = concat(inheritedTags, options.tags) }
+
+    let route = {
+        method:      method,
+        pattern:     compiled.pattern,
+        compiled:    compiled,
+        pathParams:  pathParamsOf(compiled),
+        handler:     handler,
+        protocol:    protocol,
+        middleware:  [],
+        deps:        {},
+        query:       nil,
+        body:        nil,
+        headers:     nil,
+        responses:   nil,
+        summary:     "",
+        description: "",
+        operationId: defaultOperationId(method, compiled.pattern),
+        tags:        tags,
+        hidden:      protocol != "http",
+        status:      0,
+        name:        "",
+    }
+
+    if typeof(options.middleware) == "array"  { route.middleware = options.middleware }
+    if typeof(options.deps) == "object"       { route.deps = options.deps }
+    if typeof(options.query) == "object"      { route.query = options.query }
+    if typeof(options.body) == "object"       { route.body = options.body }
+    if typeof(options.headers) == "object"    { route.headers = options.headers }
+    if typeof(options.responses) == "object"  { route.responses = options.responses }
+    if typeof(options.summary) == "string"    { route.summary = options.summary }
+    if typeof(options.description) == "string" { route.description = options.description }
+    if typeof(options.operationId) == "string" { route.operationId = options.operationId }
+    if typeof(options.name) == "string"       { route.name = options.name }
+    if typeof(options.status) == "int"        { route.status = options.status }
+    if typeof(options.hidden) == "bool"       { route.hidden = options.hidden }
+    return route
+}
+
+fn cloneRoute(route): object {
+    let copy = {}
+    for key in route { copy[key] = route[key] }
+    return copy
+}
+
+fn pathParamsOf(compiled): object[] {
+    let out = []
+    for segment in compiled.segments {
+        if segment.name != "" {
+            out = append(out, {name: segment.name, conv: segment.conv})
+        }
+    }
+    return out
+}
+
+fn defaultOperationId(method: string, pattern: string): string {
+    let cleaned = strings.replace(pattern, "/", "_")
+    cleaned = strings.replace(cleaned, "{", "")
+    cleaned = strings.replace(cleaned, "}", "")
+    cleaned = strings.replace(cleaned, ":", "_")
+    cleaned = strings.replace(cleaned, "*", "all")
+    return strings.lower(method) + cleaned
+}
+
+// routeSpec unpacks the second argument of every registration method: a bare
+// handler, or an object carrying the handler alongside its declarations.
+fn routeSpec(spec): object {
+    if isCallable(spec) { return {handler: spec, options: {}} }
+    if typeof(spec) == "object" {
+        let handler = spec.handler
+        if !isCallable(handler) {
+            throw {kind: "RouteError", message: "route spec needs a handler: {handler: fn(req) {…}, …}"}
+        }
+        return {handler: handler, options: spec}
+    }
+    throw {kind: "RouteError", message: "expected a handler function or a route spec object"}
+}
+
+fn runShutdown(app, code: int) {
+    for hook in app.shutdownHooks {
+        let run = hook
+        try {
+            run(app)
+        } catch e {
+            println("fastgoost: shutdown hook failed: " + errorText(e))
+        }
+    }
+    exit(code)
+}
+
+// newApp creates an application.
+//
+// Options: title, version, description (documentation metadata), prefix (a
+// path every route sits under), docs (false to serve no documentation at
+// all), openapiUrl, docsUrl, redocUrl (where to serve it), servers (an
+// OpenAPI server list).
+fn newApp(...args): App {
+    let options = {}
+    if len(args) > 0 && typeof(args[0]) == "object" { options = args[0] }
+
+    let info = {
+        title:       "fastgoost",
+        version:     "0.1.0",
+        description: "",
+        docs:        true,
+        openapiUrl:  "/openapi.json",
+        docsUrl:     "/docs",
+        redocUrl:    "/redoc",
+        servers:     nil,
+    }
+    for key in options {
+        if typeof(info[key]) != "void" || key == "servers" || key == "description" {
+            info[key] = options[key]
+        }
+    }
+    if typeof(options.docs) == "bool" { info.docs = options.docs }
+
+    let prefix = ""
+    if typeof(options.prefix) == "string" { prefix = options.prefix }
+
+    let tags = []
+    if typeof(options.tags) == "array" { tags = options.tags }
+
+    return App{
+        prefix:           normalisePrefix(prefix),
+        routes:           [],
+        middleware:       [],
+        tags:             tags,
+        info:             info,
+        state:            {},
+        startupHooks:     [],
+        shutdownHooks:    [],
+        errorHandlers:    {},
+        exceptionHandler: nil,
+        staticRoutes:     {},
+        prepared:         false,
+        docsInstalled:    false,
+    }
+}
+
+// ── The request pipeline ───────────────────────────────────────────────────
+
+// handleRequest turns a raw request from the server loop into a wire
+// response. Global middleware wraps everything, including the 404 — which is
+// what makes a logger or a CORS layer see every request, not just routed ones.
+fn handleRequest(app, rawRequest): object {
+    if !app.prepared {
+        app.installDocs()
+        app.sortRoutes()
+    }
+
+    let req = Request{
+        method:     rawRequest.method,
+        path:       normalisePath(rawRequest.path),
+        rawQuery:   rawRequest.rawQuery,
+        version:    rawRequest.version,
+        headers:    rawRequest.headers,
+        rawHeaders: rawRequest.rawHeaders,
+        body:       rawRequest.body,
+        conn:       rawRequest.conn,
+        remoteAddr: rawRequest.remoteAddr,
+        params:     {},
+        query:      parseQuery(rawRequest.rawQuery),
+        data:       nil,
+        state:      {},
+        deps:       {},
+        app:        app,
+        cookieJar:  nil,
+        route:      nil,
+        startedAt:  time.clock.unixMilli(),
+    }
+
+    let pipeline = chain(app.middleware, 0, fn(request) {
+        return dispatch(app, request)
+    })
+
+    let result = nil
+    try {
+        result = pipeline(req)
+    } catch e {
+        result = errorToResponse(app, req, e)
+    }
+
+    if typeof(result) == "object" && typeof(result.hijacked) == "bool" && result.hijacked {
+        return result
+    }
+    return toWire(result, req)
+}
+
+// chain folds a middleware list into a single function, innermost last. Each
+// middleware is `fn(req, next)`; whether it calls next, and what it does with
+// the response, is up to it.
+fn chain(middleware, index: int, final) {
+    if index >= len(middleware) { return final }
+    let current = middleware[index]
+    let rest = chain(middleware, index + 1, final)
+    return fn(req) {
+        return current(req, rest)
+    }
+}
+
+// dispatch finds the route, validates the request against what the route
+// declared, and runs the handler behind its own middleware.
+fn dispatch(app, req) {
+    let found = findRoute(app, req)
+
+    if typeof(found.route) == "void" {
+        if req.method == "OPTIONS" && len(found.allowed) > 0 {
+            let resp = makeResponse(204, "", "")
+            return resp.header("Allow", strings.join(withOptions(found.allowed), ", "))
+        }
+        if len(found.allowed) > 0 {
+            let err = httpError(405, "method not allowed")
+            err.headers = {Allow: strings.join(withOptions(found.allowed), ", ")}
+            throw err
+        }
+        throw httpError(404, "not found")
+    }
+
+    let route = found.route
+    req.params = found.params
+    req.route = route
+
+    if route.protocol == "sse" { return serveStream(route, req) }
+    if route.protocol == "ws" { return serveSocket(route, req) }
+
+    validateRequest(route, req)
+    resolveDeps(route, req)
+
+    let handler = route.handler
+    let pipeline = chain(route.middleware, 0, fn(request) {
+        return handler(request)
+    })
+    let result = pipeline(req)
+
+    // A route may declare the status its success case uses, so a handler that
+    // just returns data still answers 201 on a create.
+    if route.status != 0 && typeof(result) != "void" && !(result is Responder) {
+        if typeof(result) == "string" { return text(result, route.status) }
+        return json(result, route.status)
+    }
+    return result
+}
+
+// findRoute resolves method and path to a route, and reports which other
+// methods the path does answer — that list is what turns a miss into a 405
+// with a correct Allow header rather than a bare 404.
+fn findRoute(app, req): object {
+    let key = req.method + " " + req.path
+    let direct = app.staticRoutes[key]
+    if typeof(direct) == "object" { return {route: direct, params: {}, allowed: []} }
+
+    // HEAD is GET without a body; the server strips it on the way out.
+    let effective = req.method
+    if effective == "HEAD" {
+        let asGet = app.staticRoutes["GET " + req.path]
+        if typeof(asGet) == "object" { return {route: asGet, params: {}, allowed: []} }
+        effective = "GET"
+    }
+
+    let allowed = []
+    for route in app.routes {
+        if route.compiled.static && route.pattern != req.path { continue }
+        let params = match(route.compiled, req.path)
+        if typeof(params) == "void" { continue }
+        if route.method == effective { return {route: route, params: params, allowed: []} }
+        if !contains(allowed, route.method) { allowed = append(allowed, route.method) }
+    }
+    return {route: nil, params: {}, allowed: allowed}
+}
+
+fn withOptions(methods): string[] {
+    let out = []
+    for method in methods { out = append(out, method) }
+    if !contains(out, "OPTIONS") { out = append(out, "OPTIONS") }
+    return out
+}
+
+// validateRequest applies the route's declared schemas. Everything that fails
+// is collected before answering, so a client fixing a form sees every problem
+// at once rather than one per round trip.
+fn validateRequest(route, req) {
+    let errors = []
+
+    if typeof(route.query) == "object" {
+        let checked = validateSchema(route.query, req.query, "query")
+        req.query = checked.value
+        errors = concat(errors, checked.errors)
+    }
+
+    if typeof(route.headers) == "object" {
+        let checked = validateSchema(route.headers, req.headers, "header")
+        errors = concat(errors, checked.errors)
+    }
+
+    if typeof(route.body) == "object" {
+        let payload = nil
+        if req.body != "" {
+            let kind = req.contentType()
+            if kind == "application/x-www-form-urlencoded" || kind == "multipart/form-data" {
+                payload = req.form().fields
+            } else {
+                payload = req.json()
+            }
+        }
+        let checked = validateSchema(route.body, payload, "body")
+        req.data = checked.value
+        errors = concat(errors, checked.errors)
+    }
+
+    if len(errors) > 0 {
+        throw httpError(422, errors)
+    }
+}
+
+// resolveDeps runs the route's dependencies and puts the results on req.deps.
+// A dependency is `fn(req)`; throwing an HTTP error from one is how an auth
+// dependency rejects a request before the handler ever runs.
+fn resolveDeps(route, req) {
+    for name in route.deps {
+        let provider = route.deps[name]
+        req.deps[name] = provider(req)
+    }
+}
+
+// ── Streaming endpoints ────────────────────────────────────────────────────
+
+fn serveStream(route, req): object {
+    let headers = "HTTP/1.1 200 OK\r\n"
+    headers = headers + "Content-Type: text/event-stream\r\n"
+    headers = headers + "Cache-Control: no-cache\r\n"
+    headers = headers + "Connection: keep-alive\r\n"
+    headers = headers + "X-Accel-Buffering: no\r\n\r\n"
+    if !sendRaw(req.conn, headers) { return hijacked() }
+
+    let stream = Stream{conn: req.conn, req: req, alive: true}
+    let handler = route.handler
+    try {
+        handler(stream)
+    } catch e {
+        println("fastgoost: SSE handler failed: " + errorText(e))
+    }
+    return hijacked()
+}
+
+fn serveSocket(route, req): object {
+    if !wsIsUpgrade(req.rawHeaders) {
+        return makeResponse(426, "text/plain; charset=utf-8", "this endpoint speaks WebSocket\n").header("Upgrade", "websocket")
+    }
+    if !wsHandshake(req.conn, req.rawHeaders) { return hijacked() }
+
+    let socket = Socket{conn: req.conn, req: req}
+    let handler = route.handler
+    try {
+        handler(socket)
+    } catch e {
+        println("fastgoost: WebSocket handler failed: " + errorText(e))
+    }
+    wsClose(req.conn)
+    return hijacked()
+}
+
+// ── Turning results into responses ─────────────────────────────────────────
+
+// toWire is the last step: whatever the handler returned becomes bytes.
+//
+//   void            204, empty
+//   string          200 text/plain
+//   object, array   200 application/json
+//   a Responder     whatever it says
+fn toWire(result, req): object {
+    if typeof(result) == "void" {
+        return wire(204, [], "")
+    }
+    if result is Responder {
+        let resp = result.intoResponse()
+        return wire(statusOf(resp), headersOf(resp), bodyOf(resp))
+    }
+    if typeof(result) == "string" {
+        return wire(200, ["Content-Type: text/plain; charset=utf-8"], result)
+    }
+    return wire(200, ["Content-Type: application/json"], stringify(result))
+}
+
+fn wire(status: int, headers, body: string): object {
+    return {status: status, rawHeaders: headers, body: body}
+}
+
+fn statusOf(resp): int {
+    if typeof(resp.status) == "int" { return resp.status }
+    return 200
+}
+
+fn headersOf(resp) {
+    if typeof(resp.rawHeaders) == "array" { return resp.rawHeaders }
+    return []
+}
+
+fn bodyOf(resp): string {
+    if typeof(resp.body) == "string" { return resp.body }
+    if typeof(resp.body) == "void" { return "" }
+    return stringify(resp.body)
+}
+
+// errorToResponse turns a thrown value into a response, preferring whatever
+// the application registered over the framework's own defaults.
+fn errorToResponse(app, req, err) {
+    if isHTTPError(err) {
+        let handler = app.errorHandlers[toString(err.status)]
+        if isCallable(handler) { return handler(req, err) }
+        return defaultErrorResponse(err)
+    }
+
+    let custom = app.exceptionHandler
+    if isCallable(custom) {
+        try {
+            return custom(req, err)
+        } catch nested {
+            println("fastgoost: exception handler failed: " + errorText(nested))
+        }
+    }
+
+    // Unexpected. Log it where the operator will see it, and tell the client
+    // nothing beyond the status — an error message is an information leak.
+    println("fastgoost: unhandled error in " + req.method + " " + req.path + ": " + errorText(err))
+    let handler = app.errorHandlers["500"]
+    if isCallable(handler) { return handler(req, err) }
+    return json({detail: "Internal Server Error"}, 500)
+}
+
+fn defaultErrorResponse(err): Response {
+    let resp = json({detail: err.detail}, err.status)
+    if typeof(err.headers) == "object" {
+        for name in err.headers { resp = resp.header(name, toString(err.headers[name])) }
+    }
+    return resp
+}
+
+// errorText renders a thrown value for a log line, whatever shape it has.
+fn errorText(err): string {
+    if typeof(err) == "object" {
+        if typeof(err.message) == "string" { return err.message }
+        return stringify(err)
+    }
+    return toString(err)
+}
+
+// ── Startup banner ─────────────────────────────────────────────────────────
+
+// The panel itself lives in banner.goost; this is the seam so that anything
+// wanting a different one only has to replace one call.
+fn printBanner(app, host: string, port: int) {
+    show(app, host, port)
+}

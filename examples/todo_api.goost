@@ -1,0 +1,122 @@
+// todo_api.goost — a CRUD API with validation, documentation and errors.
+//
+//   ./langoost run examples/todo_api.goost
+//   curl localhost:8080/todos
+//   curl -X POST localhost:8080/todos -H 'content-type: application/json' -d '{"title":"buy milk"}'
+//   curl -X POST localhost:8080/todos -H 'content-type: application/json' -d '{"title":""}'
+//   open http://localhost:8080/docs
+//
+// The shape of the thing: handlers are named functions, schemas are named
+// bindings, and each route is one line that says what it accepts and what it
+// is for. The schema is not documentation *about* the endpoint — it is what
+// validates the request, so the two cannot drift apart.
+
+import { newApp, newRouter, res, err, Str, Int, Bool, List } from "../fastgoost"
+import { logger, cors, requestId } from "../fastgoost/middleware.goost"
+
+// ── Store ──────────────────────────────────────────────────────────────────
+//
+// A module-level object, shared by every request thread. Real services put a
+// database here; the point is that the handler below does not care which.
+
+let store = {items: {}, nextId: 1}
+
+fn allTodos() {
+    let out = []
+    for id in store.items { out = append(out, store.items[id]) }
+    return out
+}
+
+fn findTodo(id: int) {
+    let todo = store.items[toString(id)]
+    if typeof(todo) == "void" { throw err.notFound("no todo with id " + toString(id)) }
+    return todo
+}
+
+// ── Schemas ────────────────────────────────────────────────────────────────
+
+let NewTodo = {
+    title: Str({minLength: 1, maxLength: 200, description: "What needs doing"}),
+    done:  Bool({default: false}),
+    tags:  List(Str(), {default: [], description: "Free-form labels"}),
+}
+
+let TodoPatch = {
+    title: Str({minLength: 1, maxLength: 200, required: false}),
+    done:  Bool({required: false}),
+    tags:  List(Str(), {required: false}),
+}
+
+let ListQuery = {
+    done:  Bool({required: false, description: "Filter by completion"}),
+    limit: Int({default: 50, min: 1, max: 200}),
+}
+
+// ── Handlers ───────────────────────────────────────────────────────────────
+
+fn listTodos(req) {
+    let items = allTodos()
+    let filtered = []
+    for todo in items {
+        if typeof(req.query.done) == "bool" && todo.done != req.query.done { continue }
+        if len(filtered) >= req.query.limit { break }
+        filtered = append(filtered, todo)
+    }
+    return {items: filtered, total: len(filtered)}
+}
+
+fn showTodo(req) {
+    return findTodo(req.params.id)
+}
+
+fn createTodo(req) {
+    let todo = {
+        id:    store.nextId,
+        title: req.data.title,
+        done:  req.data.done,
+        tags:  req.data.tags,
+    }
+    store.items[toString(todo.id)] = todo
+    store.nextId += 1
+    return res.status(201).header("Location", "/todos/" + toString(todo.id)).json(todo)
+}
+
+fn patchTodo(req) {
+    let todo = findTodo(req.params.id)
+    if typeof(req.data.title) == "string" { todo.title = req.data.title }
+    if typeof(req.data.done) == "bool"    { todo.done = req.data.done }
+    if typeof(req.data.tags) == "array"   { todo.tags = req.data.tags }
+    return todo
+}
+
+fn deleteTodo(req) {
+    findTodo(req.params.id)
+    store.items[toString(req.params.id)] = nil
+    return res.noContent()
+}
+
+// ── Routes ─────────────────────────────────────────────────────────────────
+
+let app = newApp({
+    title:       "Todo API",
+    version:     "1.0.0",
+    description: "A worked example: validation, documentation and errors from one declaration.",
+})
+
+app.use(requestId())
+app.use(logger())
+app.use(cors())
+
+let todos = newRouter("/todos", {tags: ["todos"]})
+
+todos.get("",           {handler: listTodos,  query: ListQuery, summary: "List todos"})
+todos.get("/{id:int}",  {handler: showTodo,   summary: "Fetch one todo", name: "todo"})
+todos.post("",          {handler: createTodo, body: NewTodo,   status: 201, summary: "Create a todo"})
+todos.patch("/{id:int}",{handler: patchTodo,  body: TodoPatch, summary: "Update a todo"})
+todos.delete("/{id:int}",{handler: deleteTodo, status: 204,    summary: "Delete a todo"})
+
+app.include(todos)
+
+app.get("/health", {handler: fn(req) { return {status: "ok"} }, hidden: true})
+
+app.run(8080)

@@ -1,0 +1,328 @@
+// validate.goost — declarative request validation.
+//
+// A schema is either a field map (name → spec) or a single spec. A spec is an
+// object; every key is optional except `kind`:
+//
+//   {
+//     kind:        "string" | "int" | "float" | "number" | "bool"
+//                | "array" | "object" | "any",
+//     required:    bool          // default: true unless `default` is present
+//     default:     any           // supplied when the value is absent
+//     nullable:    bool          // allow an explicit null
+//     min, max:    number        // numeric bounds, inclusive
+//     minLength,
+//     maxLength:   int           // length bounds for strings and arrays
+//     pattern:     string        // regular expression, strings only
+//     enum:        any[]         // allowed values
+//     items:       spec          // element spec, arrays only
+//     fields:      field map     // nested field specs, objects only
+//     description: string        // documentation, surfaces in OpenAPI
+//     example:     any
+//   }
+//
+// The key is `kind` rather than `type` because `type` is a reserved word in
+// Langoost and `spec.type` will not parse. A quoted `"type":` key is accepted
+// as a synonym for anyone porting a schema from elsewhere.
+//
+// Validation coerces as well as checks, because a query string only ever
+// carries text: {kind: "int"} against "42" yields the int 42, and against
+// "abc" yields an error rather than a zero.
+//
+// Internal to fastgoost, but self-contained — `validateSchema` is usable on
+// its own for anything that needs to check a shape.
+
+import strings
+import regex
+
+fn validateSchema(schema, value, where: string): object {
+    let errors = []
+    let out = value
+    if isSpec(schema) {
+        out = checkValue(schema, value, [where], errors, true)
+    } else {
+        out = checkFields(schema, value, [where], errors)
+    }
+    return {ok: len(errors) == 0, value: out, errors: errors}
+}
+
+// isSpec distinguishes a single spec from a map of them. A spec is an object
+// carrying a string `kind`; anything else is read as a field map. Declare
+// `{kind: "object", fields: {...}}` when a field of yours is itself named
+// "kind" and the guess would go the wrong way.
+fn isSpec(schema): bool {
+    if typeof(schema) != "object" { return false }
+    return typeof(specKind(schema)) == "string"
+}
+
+// specKind reads the declared type, accepting either spelling.
+fn specKind(spec) {
+    if typeof(spec.kind) == "string" { return spec.kind }
+    return spec["type"]
+}
+
+// ── Field maps ─────────────────────────────────────────────────────────────
+
+fn checkFields(fields, value, loc, errors): object {
+    if typeof(value) != "object" {
+        errors.push(err(loc, "expected an object, got " + typeName(value), "object_type"))
+        return {}
+    }
+
+    let out = {}
+    for name in fields {
+        let spec = fields[name]
+        let sub = append(loc, name)
+        if !isSpec(spec) {
+            // A bare nested map is shorthand for {type: "object", fields: …}.
+            out[name] = checkFields(spec, value[name], sub, errors)
+            continue
+        }
+        let got = checkValue(spec, value[name], sub, errors, false)
+        if typeof(got) != "void" || hasDefault(spec) {
+            out[name] = got
+        }
+    }
+
+    // Unknown keys pass through untouched. Being strict here would break the
+    // common case of a client sending a field the server has not learned yet.
+    for name in value {
+        if typeof(fields[name]) == "void" { out[name] = value[name] }
+    }
+    return out
+}
+
+fn hasDefault(spec): bool {
+    return typeof(spec.default) != "void"
+}
+
+// ── Single values ──────────────────────────────────────────────────────────
+
+// checkValue coerces and validates one value against one spec. `atRoot` marks
+// the whole-body case, where a missing value is reported against the body
+// itself rather than against a named field.
+fn checkValue(spec, value, loc, errors, atRoot: bool) {
+    // Absent — fall back to the default, or complain if it was required.
+    if typeof(value) == "void" {
+        if hasDefault(spec) { return spec.default }
+        if typeof(spec.nullable) == "bool" && spec.nullable { return nil }
+        if isRequired(spec) {
+            if atRoot {
+                errors.push(err(loc, "request body required", "missing"))
+            } else {
+                errors.push(err(loc, "field required", "missing"))
+            }
+        }
+        return
+    }
+
+    let want = specKind(spec)
+    if want == "any" || typeof(want) != "string" { return value }
+
+    let coerced = coerce(want, value)
+    if typeof(coerced) == "void" {
+        if typeof(spec.nullable) == "bool" && spec.nullable { return nil }
+        errors.push(err(loc, "expected " + want + ", got " + typeName(value), want + "_type"))
+        return
+    }
+
+    checkConstraints(spec, coerced, loc, errors)
+
+    if want == "array" && isSpec(spec.items) {
+        let items = []
+        let i = 0
+        while i < len(coerced) {
+            items = append(items, checkValue(spec.items, coerced[i], append(loc, i), errors, false))
+            i += 1
+        }
+        return items
+    }
+    if want == "object" && typeof(spec.fields) == "object" {
+        return checkFields(spec.fields, coerced, loc, errors)
+    }
+    return coerced
+}
+
+// isRequired: required by default, optional as soon as a default is supplied.
+// The explicit `required` key wins over both.
+// isRequired: required by default, optional as soon as a default is supplied.
+// The explicit `required` key wins over both.
+fn isRequired(spec): bool {
+    if typeof(spec) != "object" { return false }
+    if typeof(spec.required) == "bool" { return spec.required }
+    return typeof(spec.default) == "void"
+}
+
+// ── Coercion ───────────────────────────────────────────────────────────────
+
+// coerce converts a value to the declared type, or returns void when the
+// conversion has no honest answer. Text in, typed value out — this is what
+// lets one schema serve both a JSON body and a query string.
+fn coerce(want: string, value) {
+    let got = typeof(value)
+
+    if want == "string" || want == "str" {
+        if got == "string" { return value }
+        if got == "int" || got == "float" || got == "bool" { return toString(value) }
+        return
+    }
+
+    if want == "int" {
+        if got == "int" { return value }
+        if got == "float" {
+            let truncated = toInt(value)
+            if toFloat(truncated) != value { return }
+            return truncated
+        }
+        if got == "string" {
+            if !numeric(value, false) { return }
+            try { return toInt(value) } catch e { return }
+        }
+        if got == "bool" {
+            if value { return 1 }
+            return 0
+        }
+        return
+    }
+
+    if want == "float" || want == "number" {
+        if got == "float" { return value }
+        if got == "int" { return toFloat(value) }
+        if got == "string" {
+            if !numeric(value, true) { return }
+            try { return toFloat(value) } catch e { return }
+        }
+        return
+    }
+
+    if want == "bool" {
+        if got == "bool" { return value }
+        if got == "string" {
+            let lower = strings.lower(value)
+            if lower == "true" || lower == "1" || lower == "yes" || lower == "on" { return true }
+            if lower == "false" || lower == "0" || lower == "no" || lower == "off" { return false }
+            return
+        }
+        if got == "int" {
+            if value == 1 { return true }
+            if value == 0 { return false }
+        }
+        return
+    }
+
+    if want == "array" {
+        if got == "array" { return value }
+        // A query string carries a single value where a list was declared;
+        // ?tag=x means [x], which is what every HTML form does.
+        if got == "string" || got == "int" || got == "float" || got == "bool" { return [value] }
+        return
+    }
+
+    if want == "object" {
+        if got == "object" { return value }
+        return
+    }
+
+    return value
+}
+
+fn numeric(raw: string, allowDot: bool): bool {
+    if raw == "" { return false }
+    let start = 0
+    if strings.hasPrefix(raw, "-") || strings.hasPrefix(raw, "+") { start = 1 }
+    let digits = 0
+    let dots = 0
+    let i = start
+    while i < len(raw) {
+        let b = strings.byteAt(raw, i)
+        if b >= 48 && b <= 57 {
+            digits += 1
+        } else if allowDot && b == 46 {
+            dots += 1
+            if dots > 1 { return false }
+        } else {
+            return false
+        }
+        i += 1
+    }
+    return digits > 0
+}
+
+// ── Constraints ────────────────────────────────────────────────────────────
+
+fn checkConstraints(spec, value, loc, errors) {
+    let kind = typeof(value)
+
+    if typeof(spec.enum) == "array" && !memberOf(spec.enum, value) {
+        errors.push(err(loc, "must be one of " + joinValues(spec.enum), "enum"))
+    }
+
+    if kind == "int" || kind == "float" {
+        if isNumber(spec.min) && toFloat(value) < toFloat(spec.min) {
+            errors.push(err(loc, "must be >= " + toString(spec.min), "greater_than_equal"))
+        }
+        if isNumber(spec.max) && toFloat(value) > toFloat(spec.max) {
+            errors.push(err(loc, "must be <= " + toString(spec.max), "less_than_equal"))
+        }
+    }
+
+    if kind == "string" || kind == "array" {
+        let n = len(value)
+        if typeof(spec.minLength) == "int" && n < spec.minLength {
+            errors.push(err(loc, "must have at least " + amount(spec.minLength, kind), "too_short"))
+        }
+        if typeof(spec.maxLength) == "int" && n > spec.maxLength {
+            errors.push(err(loc, "must have at most " + amount(spec.maxLength, kind), "too_long"))
+        }
+    }
+
+    if kind == "string" && typeof(spec.pattern) == "string" {
+        let matched = false
+        try {
+            matched = regex.match(spec.pattern, value)
+        } catch e {
+            matched = true          // a broken pattern is the schema's bug, not the client's
+        }
+        if !matched {
+            errors.push(err(loc, "does not match " + spec.pattern, "pattern"))
+        }
+    }
+}
+
+// amount renders a length bound in the units of what was measured, singular
+// or plural — "at least 1 character", not "at least 1 characters".
+fn amount(count: int, kind: string): string {
+    let unit = "item"
+    if kind == "string" { unit = "character" }
+    if count != 1 { unit = unit + "s" }
+    return toString(count) + " " + unit
+}
+
+fn isNumber(v): bool {
+    return typeof(v) == "int" || typeof(v) == "float"
+}
+
+fn memberOf(allowed, value): bool {
+    for candidate in allowed {
+        if typeof(candidate) == typeof(value) && candidate == value { return true }
+        if toString(candidate) == toString(value) { return true }
+    }
+    return false
+}
+
+fn joinValues(values): string {
+    let parts = []
+    for v in values { parts = append(parts, toString(v)) }
+    return strings.join(parts, ", ")
+}
+
+// ── Error records ──────────────────────────────────────────────────────────
+
+fn err(loc, msg: string, kind: string): object {
+    return {loc: loc, msg: msg, "type": kind}
+}
+
+fn typeName(value): string {
+    let t = typeof(value)
+    if t == "void" { return "null" }
+    return t
+}

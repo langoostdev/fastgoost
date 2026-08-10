@@ -1,0 +1,176 @@
+// middleware_test.goost — the built-in middleware, and the HTTP plumbing
+// underneath it.
+
+import { eq, ok } from "assert"
+import { newApp, res } from "../fastgoost"
+import { request } from "../fastgoost/testing.goost"
+import { cors, requestId, securityHeaders, basicAuth, rateLimit, timing } from "../fastgoost/middleware.goost"
+import { statusText, mimeType, parseQuery, buildQuery, parseCookieHeader, setCookieLine } from "../fastgoost/httpx.goost"
+import { normalisePath, joinPath, contentTypeBase, headerMap } from "../fastgoost/httpx.goost"
+
+fn appWith(middleware) {
+    let app = newApp({title: "MW", version: "1.0.0", docs: false})
+    app.use(middleware)
+    app.get("/", fn(req) { return {ok: true} })
+    return app
+}
+
+// ── httpx ──────────────────────────────────────────────────────────────────
+
+fn test_status_phrases_fall_back_by_class() {
+    eq(statusText(404), "Not Found")
+    eq(statusText(299), "Success")
+    eq(statusText(599), "Server Error")
+}
+
+fn test_mime_types() {
+    eq(mimeType("/a/b.HTML"), "text/html; charset=utf-8")
+    eq(mimeType("app.js"), "text/javascript; charset=utf-8")
+    eq(mimeType("noextension"), "application/octet-stream")
+}
+
+fn test_query_parsing_round_trips() {
+    let parsed = parseQuery("a=1&b=x&b=y&flag&e=")
+    eq(parsed.a, "1")
+    eq(len(parsed.b), 2)
+    eq(parsed.flag, "")
+    eq(parsed.e, "")
+    eq(buildQuery({a: "1", b: ["x", "y"]}), "a=1&b=x&b=y")
+    eq(parseQuery("a=hello+world%21").a, "hello world!")
+}
+
+fn test_path_normalisation_cannot_climb_out() {
+    eq(normalisePath("/a//b/../c/./"), "/a/c")
+    eq(normalisePath("/../../etc/passwd"), "/etc/passwd")
+    eq(normalisePath(""), "/")
+    eq(joinPath("/api", "/x"), "/api/x")
+    eq(joinPath("/api/", "/"), "/api")
+    eq(joinPath("", "/y"), "/y")
+}
+
+fn test_header_and_cookie_parsing() {
+    let headers = headerMap(["Host: a.com", "X-A: 1", "x-a: 2"])
+    eq(headers.host, "a.com")
+    eq(headers["x-a"], "1, 2")               // repeats join, per RFC 9110
+    eq(contentTypeBase("application/json; charset=utf-8"), "application/json")
+    eq(parseCookieHeader("s=abc; u=%20de").u, " de")
+}
+
+fn test_cookies_default_to_the_safe_attributes() {
+    let line = setCookieLine("s", "v", {})
+    ok(line == "s=v; Path=/; HttpOnly; SameSite=Lax")
+    ok(setCookieLine("s", "v", {maxAge: 60, secure: true}) == "s=v; Path=/; Max-Age=60; HttpOnly; Secure; SameSite=Lax")
+}
+
+// ── requestId ──────────────────────────────────────────────────────────────
+
+fn test_request_id_is_generated_and_echoed() {
+    let resp = request(appWith(requestId()), "GET", "/")
+    ok(resp.header("x-request-id") != "")
+}
+
+fn test_a_client_supplied_id_survives_the_hop() {
+    let resp = request(appWith(requestId()), "GET", "/", {headers: {"X-Request-Id": "trace-1"}})
+    eq(resp.header("x-request-id"), "trace-1")
+}
+
+fn test_an_untrusted_id_is_replaced() {
+    let resp = request(appWith(requestId({trust: false})), "GET", "/", {headers: {"X-Request-Id": "spoofed"}})
+    ok(resp.header("x-request-id") != "spoofed")
+}
+
+// ── cors ───────────────────────────────────────────────────────────────────
+
+fn test_cors_is_silent_without_an_origin() {
+    let resp = request(appWith(cors()), "GET", "/")
+    eq(resp.header("access-control-allow-origin"), "")
+}
+
+fn test_cors_answers_a_preflight_without_reaching_the_route() {
+    let app = newApp({title: "MW", version: "1.0.0", docs: false})
+    app.use(cors({origins: ["https://ok.example"]}))
+    app.get("/", fn(req) { return "never for OPTIONS" })
+    let resp = request(app, "OPTIONS", "/", {headers: {
+        Origin: "https://ok.example",
+        "Access-Control-Request-Method": "POST",
+    }})
+    eq(resp.status, 204)
+    eq(resp.header("access-control-allow-origin"), "https://ok.example")
+    eq(resp.header("vary"), "Origin")
+    ok(resp.header("access-control-allow-methods") != "")
+}
+
+fn test_cors_ignores_an_origin_it_does_not_allow() {
+    let resp = request(appWith(cors({origins: ["https://ok.example"]})), "GET", "/",
+                       {headers: {Origin: "https://evil.example"}})
+    eq(resp.status, 200)
+    eq(resp.header("access-control-allow-origin"), "")
+}
+
+fn test_wildcard_with_credentials_is_refused_at_startup() {
+    // Browsers reject the combination, so failing here beats failing in
+    // production on the first request that carries a cookie.
+    let threw = false
+    try {
+        cors({origins: ["*"], credentials: true})
+    } catch e {
+        threw = true
+    }
+    ok(threw)
+}
+
+// ── securityHeaders / timing ───────────────────────────────────────────────
+
+fn test_security_headers_are_set() {
+    let resp = request(appWith(securityHeaders({csp: "default-src 'self'"})), "GET", "/")
+    eq(resp.header("x-content-type-options"), "nosniff")
+    eq(resp.header("x-frame-options"), "DENY")
+    eq(resp.header("content-security-policy"), "default-src 'self'")
+}
+
+fn test_timing_reports_a_duration() {
+    ok(request(appWith(timing()), "GET", "/").header("server-timing") != "")
+}
+
+// ── basicAuth ──────────────────────────────────────────────────────────────
+
+fn test_basic_auth_challenges_without_credentials() {
+    let resp = request(appWith(basicAuth({users: {ada: "lovelace"}})), "GET", "/")
+    eq(resp.status, 401)
+    ok(resp.header("www-authenticate") != "")
+}
+
+fn test_basic_auth_accepts_the_right_password_and_names_the_user() {
+    let app = newApp({title: "MW", version: "1.0.0", docs: false})
+    app.use(basicAuth({users: {ada: "lovelace"}}))
+    app.get("/", fn(req) { return {user: req.state.user} })
+    // "ada:lovelace" base64-encoded
+    let resp = request(app, "GET", "/", {headers: {Authorization: "Basic YWRhOmxvdmVsYWNl"}})
+    eq(resp.status, 200)
+    eq(resp.json().user, "ada")
+}
+
+fn test_basic_auth_rejects_the_wrong_password() {
+    // "ada:wrong"
+    let resp = request(appWith(basicAuth({users: {ada: "lovelace"}})), "GET", "/",
+                       {headers: {Authorization: "Basic YWRhOndyb25n"}})
+    eq(resp.status, 401)
+}
+
+// ── rateLimit ──────────────────────────────────────────────────────────────
+
+fn test_rate_limit_counts_down_then_refuses() {
+    let app = appWith(rateLimit({limit: 2, windowMs: 60000}))
+    eq(request(app, "GET", "/").header("x-ratelimit-remaining"), "1")
+    eq(request(app, "GET", "/").header("x-ratelimit-remaining"), "0")
+    let over = request(app, "GET", "/")
+    eq(over.status, 429)
+    ok(over.header("retry-after") != "")
+}
+
+fn test_rate_limit_budgets_each_client_separately() {
+    let app = appWith(rateLimit({limit: 1, windowMs: 60000}))
+    eq(request(app, "GET", "/", {remoteAddr: "10.0.0.1:1"}).status, 200)
+    eq(request(app, "GET", "/", {remoteAddr: "10.0.0.2:1"}).status, 200)
+    eq(request(app, "GET", "/", {remoteAddr: "10.0.0.1:1"}).status, 429)
+}

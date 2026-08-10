@@ -1,0 +1,253 @@
+// ws.goost — server-side WebSocket framing, RFC 6455.
+//
+// Langoost ships a `websocket` module, but it does not compile in current
+// builds: goostlib/websocket.goost declares `fn upgradeHeaders(…): string[]`
+// and returns an array literal, which the return-type checker rejects, so
+// importing it fails the whole program. This module covers the same ground
+// with no dependency on it.
+//
+// What it does: the upgrade handshake, masked client frames in, unmasked
+// server frames out, continuation frames reassembled, ping answered with
+// pong, close acknowledged. Extensions (permessage-deflate) are not
+// negotiated, so no frame ever arrives compressed.
+//
+// The six functions the framework calls are prefixed `ws` — wsIsUpgrade,
+// wsHandshake, wsRecv, wsSend, wsSendBinary, wsClose — because `send` and
+// `close` are too generic to import into a module that has its own.
+//
+// Internal to fastgoost — the public surface is the Socket class in main.
+
+import net
+import strings
+import { sha1 } from "crypto"
+import { hex, base64 } from "encode"
+import { bitwise } from "math"
+
+let MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+let OP_CONTINUE = 0
+let OP_TEXT     = 1
+let OP_BINARY   = 2
+let OP_CLOSE    = 8
+let OP_PING     = 9
+let OP_PONG     = 10
+
+// A frame larger than this is refused rather than buffered. A WebSocket peer
+// that asks to wsSend 4 GiB in one message is not a peer worth trusting.
+let MAX_MESSAGE = 8388608
+
+// ── Handshake ──────────────────────────────────────────────────────────────
+
+// wsIsUpgrade reports whether these request headers ask for a WebSocket.
+fn wsIsUpgrade(headers): bool {
+    let upgrade = strings.lower(headerOf(headers, "Upgrade"))
+    let connection = strings.lower(headerOf(headers, "Connection"))
+    if upgrade != "websocket" { return false }
+    if !strings.contains(connection, "upgrade") { return false }
+    return headerOf(headers, "Sec-WebSocket-Key") != ""
+}
+
+// acceptKey computes the Sec-WebSocket-Accept response value: the client's
+// key, concatenated with the protocol's fixed GUID, SHA-1'd and base64'd.
+fn acceptKey(headers): string {
+    let key = headerOf(headers, "Sec-WebSocket-Key")
+    if key == "" { return "" }
+    return base64.encode(hex.decode(sha1(key + MAGIC)))
+}
+
+// wsHandshake writes the 101 response. After it returns true the socket is no
+// longer speaking HTTP and must not be written to as though it were.
+fn wsHandshake(conn: int, headers): bool {
+    let accept = acceptKey(headers)
+    if accept == "" { return false }
+    let out = "HTTP/1.1 101 Switching Protocols\r\n"
+    out = out + "Upgrade: websocket\r\n"
+    out = out + "Connection: Upgrade\r\n"
+    out = out + "Sec-WebSocket-Accept: " + accept + "\r\n"
+    let protocol = headerOf(headers, "Sec-WebSocket-Protocol")
+    if protocol != "" {
+        // Echo the first offered subprotocol; a client that asked for one and
+        // gets no answer is entitled to hang up.
+        let first = strings.trim(strings.split(protocol, ",")[0])
+        out = out + "Sec-WebSocket-Protocol: " + first + "\r\n"
+    }
+    return net.send(conn, out + "\r\n")
+}
+
+fn headerOf(headers, name: string): string {
+    let want = strings.lower(name) + ":"
+    for line in headers {
+        if strings.hasPrefix(strings.lower(line), want) {
+            return strings.trim(strings.slice(line, len(want), len(line)))
+        }
+    }
+    return ""
+}
+
+// ── Reading ────────────────────────────────────────────────────────────────
+
+// wsRecv reads one whole message, reassembling continuation frames and dealing
+// with control frames along the way. Returns void when the peer closes, the
+// connection breaks, or the message would be larger than MAX_MESSAGE.
+//
+// The loop is flat rather than recursive: a peer that sends nothing but pings
+// would otherwise walk the value stack straight into an overflow.
+fn wsRecv(conn: int) {
+    let assembled = ""
+    let assembling = false
+
+    while true {
+        let frame = readFrame(conn)
+        if typeof(frame) == "void" { return }
+
+        if frame.opcode == OP_CLOSE {
+            sendFrame(conn, OP_CLOSE, "")
+            return
+        }
+        if frame.opcode == OP_PING {
+            sendFrame(conn, OP_PONG, frame.payload)
+            continue
+        }
+        if frame.opcode == OP_PONG {
+            continue
+        }
+
+        if frame.opcode == OP_TEXT || frame.opcode == OP_BINARY {
+            if frame.fin { return frame.payload }
+            assembled = frame.payload
+            assembling = true
+            continue
+        }
+
+        if frame.opcode == OP_CONTINUE {
+            if !assembling { return }
+            if len(assembled) + len(frame.payload) > MAX_MESSAGE { return }
+            assembled = assembled + frame.payload
+            if frame.fin { return assembled }
+            continue
+        }
+
+        return                                  // reserved opcode: give up
+    }
+}
+
+// readFrame reads exactly one frame off the wire.
+fn readFrame(conn: int) {
+    let head = readExact(conn, 2)
+    if len(head) < 2 { return }
+
+    let b0 = strings.byteAt(head, 0)
+    let b1 = strings.byteAt(head, 1)
+    let fin = bitwise.and(b0, 128) != 0
+    let opcode = bitwise.and(b0, 15)
+    let masked = bitwise.and(b1, 128) != 0
+    let length = bitwise.and(b1, 127)
+
+    if length == 126 {
+        let ext = readExact(conn, 2)
+        if len(ext) < 2 { return }
+        length = strings.byteAt(ext, 0) * 256 + strings.byteAt(ext, 1)
+    } else if length == 127 {
+        let ext = readExact(conn, 8)
+        if len(ext) < 8 { return }
+        length = 0
+        let i = 0
+        while i < 8 {
+            length = length * 256 + strings.byteAt(ext, i)
+            if length > MAX_MESSAGE { return }
+            i += 1
+        }
+    }
+    if length > MAX_MESSAGE { return }
+
+    // Every client→server frame must be masked. One that is not is either a
+    // broken client or someone speaking the protocol by hand.
+    let mask = ""
+    if masked {
+        mask = readExact(conn, 4)
+        if len(mask) < 4 { return }
+    }
+
+    let payload = ""
+    if length > 0 {
+        payload = readExact(conn, length)
+        if len(payload) < length { return }
+        if masked { payload = unmask(payload, mask) }
+    }
+
+    return {fin: fin, opcode: opcode, payload: payload}
+}
+
+fn unmask(payload: string, mask: string): string {
+    let bytes = strings.toBytes(payload)
+    let keys = strings.toBytes(mask)
+    let out = []
+    let i = 0
+    while i < len(bytes) {
+        out = append(out, bitwise.xor(bytes[i], keys[i % 4]))
+        i += 1
+    }
+    return strings.fromBytes(out)
+}
+
+fn readExact(conn: int, n: int): string {
+    let out = ""
+    let remaining = n
+    while remaining > 0 {
+        let chunk = net.recv(conn, remaining)
+        if len(chunk) == 0 { return out }
+        out = out + chunk
+        remaining = remaining - len(chunk)
+    }
+    return out
+}
+
+// ── Writing ────────────────────────────────────────────────────────────────
+
+// sendFrame writes one server→client frame. Server frames are never masked.
+fn sendFrame(conn: int, opcode: int, payload: string): bool {
+    let n = len(payload)
+    let head = []
+    head = append(head, bitwise.or(128, opcode))
+
+    if n < 126 {
+        head = append(head, n)
+    } else if n < 65536 {
+        head = append(head, 126)
+        head = append(head, bitwise.and(n / 256, 255))
+        head = append(head, bitwise.and(n, 255))
+    } else {
+        head = append(head, 127)
+        let eight = [0, 0, 0, 0, 0, 0, 0, 0]
+        let remaining = n
+        let i = 0
+        while i < 8 {
+            eight[7 - i] = bitwise.and(remaining, 255)
+            remaining = remaining / 256
+            i += 1
+        }
+        for b in eight { head = append(head, b) }
+    }
+
+    // One write for header plus payload: two sends would let a concurrent
+    // writer interleave a frame between them and corrupt the stream.
+    return net.send(conn, strings.fromBytes(head) + payload)
+}
+
+fn wsSend(conn: int, message: string): bool {
+    return sendFrame(conn, OP_TEXT, message)
+}
+
+fn wsSendBinary(conn: int, data: string): bool {
+    return sendFrame(conn, OP_BINARY, data)
+}
+
+fn ping(conn: int, payload: string): bool {
+    return sendFrame(conn, OP_PING, payload)
+}
+
+// wsClose sends the wsClose frame and drops the socket.
+fn wsClose(conn: int) {
+    sendFrame(conn, OP_CLOSE, "")
+    net.close(conn)
+}

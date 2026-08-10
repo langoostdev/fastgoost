@@ -1,0 +1,129 @@
+// validate_test.goost — schemas: what they accept, what they convert, and
+// what they say when they refuse.
+
+import { eq, ok } from "assert"
+import { validateSchema } from "../fastgoost/validate.goost"
+
+fn check(schema, value) {
+    return validateSchema(schema, value, "body")
+}
+
+fn firstError(result): string {
+    return result.errors[0].msg
+}
+
+fn test_accepts_a_valid_object() {
+    let result = check({name: {kind: "string"}, age: {kind: "int"}}, {name: "Ada", age: 36})
+    ok(result.ok)
+    eq(result.value.name, "Ada")
+    eq(result.value.age, 36)
+}
+
+fn test_converts_text_to_the_declared_type() {
+    // This is what makes one schema serve both a JSON body and a query string.
+    let result = check({age: {kind: "int"}, paid: {kind: "bool"}, rate: {kind: "float"}},
+                       {age: "36", paid: "yes", rate: "1.5"})
+    ok(result.ok)
+    eq(typeof(result.value.age), "int")
+    eq(result.value.age, 36)
+    eq(result.value.paid, true)
+    eq(result.value.rate, 1.5)
+}
+
+fn test_refuses_a_conversion_that_would_lie() {
+    ok(!check({age: {kind: "int"}}, {age: "abc"}).ok)
+    ok(!check({age: {kind: "int"}}, {age: 1.5}).ok)
+    ok(!check({paid: {kind: "bool"}}, {paid: "maybe"}).ok)
+    // A float that happens to be whole is an honest int.
+    ok(check({age: {kind: "int"}}, {age: 36.0}).ok)
+}
+
+fn test_defaults_fill_in_and_make_a_field_optional() {
+    let result = check({role: {kind: "string", default: "user"}}, {})
+    ok(result.ok)
+    eq(result.value.role, "user")
+}
+
+fn test_a_field_without_a_default_is_required() {
+    let result = check({name: {kind: "string"}}, {})
+    ok(!result.ok)
+    eq(firstError(result), "field required")
+    eq(result.errors[0]["type"], "missing")
+    eq(result.errors[0].loc[1], "name")
+}
+
+fn test_bounds() {
+    ok(!check({n: {kind: "int", min: 1}}, {n: 0}).ok)
+    ok(!check({n: {kind: "int", max: 10}}, {n: 11}).ok)
+    ok(check({n: {kind: "int", min: 1, max: 10}}, {n: 5}).ok)
+}
+
+fn test_lengths_count_in_the_right_units() {
+    eq(firstError(check({s: {kind: "string", minLength: 2}}, {s: "a"})), "must have at least 2 characters")
+    eq(firstError(check({s: {kind: "array", minLength: 2, items: {kind: "int"}}}, {s: [1]})),
+       "must have at least 2 items")
+    eq(firstError(check({s: {kind: "string", minLength: 1}}, {s: ""})), "must have at least 1 character")
+}
+
+fn test_enum_and_pattern() {
+    ok(!check({r: {kind: "string", enum: ["a", "b"]}}, {r: "c"}).ok)
+    ok(check({r: {kind: "string", enum: ["a", "b"]}}, {r: "b"}).ok)
+    ok(!check({e: {kind: "string", pattern: "^[^@]+@[^@]+$"}}, {e: "nope"}).ok)
+    ok(check({e: {kind: "string", pattern: "^[^@]+@[^@]+$"}}, {e: "a@b"}).ok)
+}
+
+fn test_every_problem_is_reported_at_once() {
+    // One round trip should tell a client everything that is wrong, not the
+    // first thing that is wrong.
+    let result = check({a: {kind: "int"}, b: {kind: "string", minLength: 5}, c: {kind: "int", max: 1}},
+                       {b: "xx", c: 9})
+    eq(len(result.errors), 3)
+}
+
+fn test_nested_objects_and_arrays() {
+    let schema = {
+        tags:   {kind: "array", items: {kind: "string"}},
+        author: {kind: "object", fields: {name: {kind: "string"}}},
+    }
+    let result = check(schema, {tags: ["a", 2], author: {name: "Ada"}})
+    ok(result.ok)
+    eq(result.value.tags[1], "2")            // coerced to the declared element type
+    eq(result.value.author.name, "Ada")
+
+    let bad = check(schema, {tags: ["a"], author: {}})
+    ok(!bad.ok)
+    eq(bad.errors[0].loc[2], "name")         // the path points into the nesting
+}
+
+fn test_a_single_value_wraps_into_a_list() {
+    // ?tag=x means [x] — one value where a list was declared is what every
+    // HTML form sends.
+    let result = validateSchema({tag: {kind: "array", items: {kind: "string"}}}, {tag: "x"}, "query")
+    ok(result.ok)
+    eq(len(result.value.tag), 1)
+    eq(result.value.tag[0], "x")
+}
+
+fn test_unknown_keys_pass_through() {
+    let result = check({a: {kind: "int"}}, {a: 1, extra: "kept"})
+    ok(result.ok)
+    eq(result.value.extra, "kept")
+}
+
+fn test_a_whole_body_can_be_one_spec() {
+    let result = check({kind: "array", items: {kind: "int"}}, ["1", 2])
+    ok(result.ok)
+    eq(result.value[0], 1)
+
+    let missing = check({kind: "object", fields: {a: {kind: "int"}}}, nil)
+    ok(!missing.ok)
+    eq(firstError(missing), "request body required")
+}
+
+fn test_quoted_type_key_is_accepted() {
+    // `type` is a reserved word, so `kind` is canonical — but a schema ported
+    // from elsewhere with a quoted "type" should still work.
+    let result = check({n: {"type": "int"}}, {n: "5"})
+    ok(result.ok)
+    eq(result.value.n, 5)
+}

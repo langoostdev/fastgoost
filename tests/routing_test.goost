@@ -1,0 +1,77 @@
+// routing_test.goost — path patterns: what matches, what does not, and which
+// route wins when several could.
+
+import { eq, ok, throws } from "assert"
+import { compile, match } from "../fastgoost/routing.goost"
+
+fn matched(pattern, path): bool {
+    return typeof(match(compile(pattern), path)) != "void"
+}
+
+fn params(pattern, path) {
+    return match(compile(pattern), path)
+}
+
+fn test_literal_paths() {
+    ok(matched("/users", "/users"))
+    ok(matched("/", "/"))
+    ok(!matched("/users", "/Users"))
+    ok(!matched("/users", "/users/1"))
+    ok(!matched("/users/1", "/users"))
+}
+
+fn test_string_parameters() {
+    eq(params("/users/{name}", "/users/ada").name, "ada")
+    eq(params("/a/{x}/b/{y}", "/a/1/b/2").y, "2")
+}
+
+fn test_converters_convert() {
+    eq(params("/u/{id:int}", "/u/42").id, 42)
+    eq(typeof(params("/u/{id:int}", "/u/42").id), "int")
+    eq(params("/u/{id:int}", "/u/-7").id, -7)
+    eq(params("/p/{v:float}", "/p/1.5").v, 1.5)
+    eq(params("/p/{v:bool}", "/p/yes").v, true)
+    eq(params("/p/{v:bool}", "/p/0").v, false)
+}
+
+fn test_converters_reject_the_wrong_shape() {
+    ok(!matched("/u/{id:int}", "/u/abc"))
+    ok(!matched("/u/{id:int}", "/u/1.5"))
+    ok(!matched("/u/{id:int}", "/u/"))
+    ok(!matched("/p/{v:bool}", "/p/maybe"))
+}
+
+fn test_greedy_segments() {
+    eq(params("/files/{rest:path}", "/files/a/b/c.txt").rest, "a/b/c.txt")
+    eq(params("/files/{rest:path}", "/files").rest, "")
+    eq(params("/assets/*", "/assets/js/app.js")["*"], "js/app.js")
+}
+
+fn test_percent_decoding() {
+    eq(params("/e/{name}", "/e/a%20b").name, "a b")
+    // %2F stays inside its segment: it cannot forge a path boundary.
+    eq(params("/e/{name}", "/e/a%2Fb").name, "a/b")
+    // Multi-byte UTF-8 is reassembled from its bytes, not mangled per escape.
+    eq(params("/e/{name}", "/e/%D0%B0%D0%B1").name, "аб")
+}
+
+fn test_literal_outranks_placeholder() {
+    // The score decides which route a dispatcher tries first, so /files/latest
+    // must outrank /files/{name} whatever order they were registered in.
+    ok(compile("/files/latest").score > compile("/files/{name}").score)
+    ok(compile("/files/{name}").score > compile("/files/*").score)
+    ok(compile("/a/b/c").score > compile("/a/b/{c}").score)
+}
+
+fn test_static_patterns_are_marked() {
+    ok(compile("/a/b").static)
+    ok(!compile("/a/{b}").static)
+    ok(!compile("/a/*").static)
+}
+
+fn test_malformed_patterns_fail_loudly() {
+    throws(fn() { compile("/bad/{x:nope}") })
+    throws(fn() { compile("/bad/pre{x}") })
+    throws(fn() { compile("/bad/{}") })
+    throws(fn() { compile("/{a:path}/tail") })
+}

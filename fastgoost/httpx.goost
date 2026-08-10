@@ -1,0 +1,333 @@
+// httpx.goost — HTTP plumbing: status phrases, MIME types, header maps,
+// query strings and cookies. Pure string work, no I/O, no state.
+//
+// Internal to fastgoost. Nothing here is part of the public API, but nothing
+// here depends on the rest of the framework either, so it is safe to import
+// on its own if you are building something lower-level.
+
+import strings
+import url
+
+fn statusText(code: int): string {
+    if code == 100 { return "Continue" }
+    if code == 101 { return "Switching Protocols" }
+    if code == 200 { return "OK" }
+    if code == 201 { return "Created" }
+    if code == 202 { return "Accepted" }
+    if code == 204 { return "No Content" }
+    if code == 206 { return "Partial Content" }
+    if code == 301 { return "Moved Permanently" }
+    if code == 302 { return "Found" }
+    if code == 303 { return "See Other" }
+    if code == 304 { return "Not Modified" }
+    if code == 307 { return "Temporary Redirect" }
+    if code == 308 { return "Permanent Redirect" }
+    if code == 400 { return "Bad Request" }
+    if code == 401 { return "Unauthorized" }
+    if code == 403 { return "Forbidden" }
+    if code == 404 { return "Not Found" }
+    if code == 405 { return "Method Not Allowed" }
+    if code == 406 { return "Not Acceptable" }
+    if code == 408 { return "Request Timeout" }
+    if code == 409 { return "Conflict" }
+    if code == 410 { return "Gone" }
+    if code == 411 { return "Length Required" }
+    if code == 413 { return "Content Too Large" }
+    if code == 414 { return "URI Too Long" }
+    if code == 415 { return "Unsupported Media Type" }
+    if code == 418 { return "I'm a teapot" }
+    if code == 422 { return "Unprocessable Content" }
+    if code == 429 { return "Too Many Requests" }
+    if code == 431 { return "Request Header Fields Too Large" }
+    if code == 500 { return "Internal Server Error" }
+    if code == 501 { return "Not Implemented" }
+    if code == 502 { return "Bad Gateway" }
+    if code == 503 { return "Service Unavailable" }
+    if code == 504 { return "Gateway Timeout" }
+    if code == 505 { return "HTTP Version Not Supported" }
+    if code >= 100 && code < 200 { return "Informational" }
+    if code >= 200 && code < 300 { return "Success" }
+    if code >= 300 && code < 400 { return "Redirection" }
+    if code >= 400 && code < 500 { return "Client Error" }
+    return "Server Error"
+}
+
+// ── MIME types ─────────────────────────────────────────────────────────────
+
+// mimeType guesses a Content-Type from a filename's extension. Text formats
+// carry an explicit charset; everything unrecognised is served as a download
+// rather than being sniffed by the browser.
+fn mimeType(path: string): string {
+    let dot = strings.lastIndexOf(path, ".")
+    if dot < 0 { return "application/octet-stream" }
+    let ext = strings.lower(strings.slice(path, dot + 1, len(path)))
+
+    if ext == "html" || ext == "htm" { return "text/html; charset=utf-8" }
+    if ext == "css"                  { return "text/css; charset=utf-8" }
+    if ext == "js" || ext == "mjs"   { return "text/javascript; charset=utf-8" }
+    if ext == "json"                 { return "application/json" }
+    if ext == "map"                  { return "application/json" }
+    if ext == "txt" || ext == "md"   { return "text/plain; charset=utf-8" }
+    if ext == "csv"                  { return "text/csv; charset=utf-8" }
+    if ext == "xml"                  { return "application/xml" }
+    if ext == "svg"                  { return "image/svg+xml" }
+    if ext == "png"                  { return "image/png" }
+    if ext == "jpg" || ext == "jpeg" { return "image/jpeg" }
+    if ext == "gif"                  { return "image/gif" }
+    if ext == "webp"                 { return "image/webp" }
+    if ext == "avif"                 { return "image/avif" }
+    if ext == "ico"                  { return "image/x-icon" }
+    if ext == "woff"                 { return "font/woff" }
+    if ext == "woff2"                { return "font/woff2" }
+    if ext == "ttf"                  { return "font/ttf" }
+    if ext == "otf"                  { return "font/otf" }
+    if ext == "pdf"                  { return "application/pdf" }
+    if ext == "zip"                  { return "application/zip" }
+    if ext == "gz"                   { return "application/gzip" }
+    if ext == "wasm"                 { return "application/wasm" }
+    if ext == "mp3"                  { return "audio/mpeg" }
+    if ext == "mp4"                  { return "video/mp4" }
+    if ext == "webm"                 { return "video/webm" }
+    return "application/octet-stream"
+}
+
+// ── Header maps ────────────────────────────────────────────────────────────
+
+// headerMap turns raw "Key: Value" lines into an object keyed by the
+// lowercased field name. Repeated fields are joined with ", ", which is what
+// RFC 9110 says a recipient may do for every field except Set-Cookie — and
+// Set-Cookie does not appear in requests.
+fn headerMap(lines: string[]): object {
+    let out = {}
+    for line in lines {
+        let colon = strings.indexOf(line, ":")
+        if colon < 0 { continue }
+        let name = strings.lower(strings.trim(strings.slice(line, 0, colon)))
+        let value = strings.trim(strings.slice(line, colon + 1, len(line)))
+        if name == "" { continue }
+        if typeof(out[name]) == "string" {
+            out[name] = out[name] + ", " + value
+        } else {
+            out[name] = value
+        }
+    }
+    return out
+}
+
+// headerValue reads one header out of a raw line array, case-insensitively.
+// Returns "" when absent, so callers can compare without a typeof dance.
+fn headerValue(lines: string[], name: string): string {
+    let want = strings.lower(name) + ":"
+    for line in lines {
+        if strings.hasPrefix(strings.lower(line), want) {
+            return strings.trim(strings.slice(line, len(want), len(line)))
+        }
+    }
+    return ""
+}
+
+// ── Content-Type ───────────────────────────────────────────────────────────
+
+// contentTypeBase strips parameters, so "application/json; charset=utf-8"
+// becomes "application/json". Lowercased, because media types are.
+fn contentTypeBase(value: string): string {
+    let semi = strings.indexOf(value, ";")
+    if semi < 0 { return strings.lower(strings.trim(value)) }
+    return strings.lower(strings.trim(strings.slice(value, 0, semi)))
+}
+
+// contentTypeParam pulls one parameter out of a Content-Type value, e.g.
+// the boundary of a multipart body. Returns "" when the parameter is absent.
+fn contentTypeParam(value: string, name: string): string {
+    let parts = strings.split(value, ";")
+    let want = strings.lower(name)
+    for part in parts {
+        let p = strings.trim(part)
+        let eq = strings.indexOf(p, "=")
+        if eq < 0 { continue }
+        let k = strings.lower(strings.trim(strings.slice(p, 0, eq)))
+        if k != want { continue }
+        let v = strings.trim(strings.slice(p, eq + 1, len(p)))
+        if len(v) >= 2 && strings.hasPrefix(v, "\"") && strings.hasSuffix(v, "\"") {
+            v = strings.slice(v, 1, len(v) - 1)
+        }
+        return v
+    }
+    return ""
+}
+
+// ── Percent decoding ───────────────────────────────────────────────────────
+
+// decodeComponent undoes percent-encoding and the form-encoding convention
+// that a plus sign means a space. Malformed escapes are left as written
+// rather than throwing — a bad query string should not take down a request.
+fn decodeComponent(s: string): string {
+    if strings.indexOf(s, "%") < 0 && strings.indexOf(s, "+") < 0 { return s }
+    let spaced = strings.replace(s, "+", " ")
+    try {
+        return url.decode(spaced)
+    } catch e {
+        return spaced
+    }
+}
+
+// encodeComponent percent-encodes a value for use in a query string.
+fn encodeComponent(s: string): string {
+    return url.encode(s)
+}
+
+// ── Query strings ──────────────────────────────────────────────────────────
+
+// parseQuery turns "a=1&b=x&b=y&flag" into {a: "1", b: ["x", "y"], flag: ""}.
+// A repeated key collects into an array; a bare key gets the empty string,
+// which is how HTML checkboxes and flag-style parameters arrive.
+fn parseQuery(raw: string): object {
+    let out = {}
+    if raw == "" { return out }
+    for pair in strings.split(raw, "&") {
+        if pair == "" { continue }
+        let eq = strings.indexOf(pair, "=")
+        let key = pair
+        let value = ""
+        if eq >= 0 {
+            key = strings.slice(pair, 0, eq)
+            value = strings.slice(pair, eq + 1, len(pair))
+        }
+        key = decodeComponent(key)
+        value = decodeComponent(value)
+        if key == "" { continue }
+        let existing = out[key]
+        if typeof(existing) == "void" {
+            out[key] = value
+        } else if typeof(existing) == "array" {
+            existing.push(value)
+        } else {
+            out[key] = [existing, value]
+        }
+    }
+    return out
+}
+
+// buildQuery is the inverse: an object of scalars and arrays back to a query
+// string, with keys in sorted order so the output is reproducible.
+fn buildQuery(params: object): string {
+    let parts = []
+    for key in params {
+        let value = params[key]
+        if typeof(value) == "array" {
+            for v in value {
+                parts = append(parts, encodeComponent(key) + "=" + encodeComponent(toString(v)))
+            }
+        } else if typeof(value) != "void" {
+            parts = append(parts, encodeComponent(key) + "=" + encodeComponent(toString(value)))
+        }
+    }
+    return strings.join(parts, "&")
+}
+
+// ── Cookies ────────────────────────────────────────────────────────────────
+
+// parseCookieHeader turns "a=1; b=2" into {a: "1", b: "2"}.
+fn parseCookieHeader(raw: string): object {
+    let out = {}
+    if raw == "" { return out }
+    for pair in strings.split(raw, ";") {
+        let p = strings.trim(pair)
+        if p == "" { continue }
+        let eq = strings.indexOf(p, "=")
+        if eq < 0 {
+            out[p] = ""
+            continue
+        }
+        let k = strings.trim(strings.slice(p, 0, eq))
+        let v = strings.trim(strings.slice(p, eq + 1, len(p)))
+        if len(v) >= 2 && strings.hasPrefix(v, "\"") && strings.hasSuffix(v, "\"") {
+            v = strings.slice(v, 1, len(v) - 1)
+        }
+        out[k] = decodeComponent(v)
+    }
+    return out
+}
+
+// setCookieLine builds one Set-Cookie header value.
+//
+// opts may carry: path, domain (string), maxAge (int, 0 expires immediately),
+// expires (string, HTTP-date), httpOnly, secure (bool), sameSite (string).
+// Defaults are the safe ones — Path=/, HttpOnly, SameSite=Lax — because a
+// session cookie written without thinking should not be the vulnerability.
+fn setCookieLine(name: string, value: string, opts: object): string {
+    let out = name + "=" + encodeComponent(value)
+
+    let path = "/"
+    if typeof(opts.path) == "string" { path = opts.path }
+    out = out + "; Path=" + path
+
+    if typeof(opts.domain) == "string" { out = out + "; Domain=" + opts.domain }
+    if typeof(opts.maxAge) == "int"    { out = out + "; Max-Age=" + toString(opts.maxAge) }
+    if typeof(opts.expires) == "string" { out = out + "; Expires=" + opts.expires }
+
+    let httpOnly = true
+    if typeof(opts.httpOnly) == "bool" { httpOnly = opts.httpOnly }
+    if httpOnly { out = out + "; HttpOnly" }
+
+    if typeof(opts.secure) == "bool" && opts.secure { out = out + "; Secure" }
+
+    let sameSite = "Lax"
+    if typeof(opts.sameSite) == "string" { sameSite = opts.sameSite }
+    if sameSite != "" { out = out + "; SameSite=" + sameSite }
+
+    return out
+}
+
+// ── Paths ──────────────────────────────────────────────────────────────────
+
+// normalisePath collapses repeated slashes, resolves "." and "..", and drops
+// a trailing slash. It is the guard that keeps a static file route inside its
+// own directory: "..%2f..%2fetc/passwd" cannot climb out of a normalised path.
+fn normalisePath(path: string): string {
+    if path == "" { return "/" }
+    let clean = []
+    for seg in strings.split(path, "/") {
+        if seg == "" || seg == "." { continue }
+        if seg == ".." {
+            if len(clean) > 0 {
+                let dropped = []
+                for i in range(len(clean) - 1) { dropped = append(dropped, clean[i]) }
+                clean = dropped
+            }
+            continue
+        }
+        clean = append(clean, seg)
+    }
+    if len(clean) == 0 { return "/" }
+    return "/" + strings.join(clean, "/")
+}
+
+// joinPath glues a router prefix onto a route path without doubling slashes.
+fn joinPath(prefix: string, path: string): string {
+    let p = prefix
+    if p == "/" { p = "" }
+    if p != "" && !strings.hasPrefix(p, "/") { p = "/" + p }
+    if strings.hasSuffix(p, "/") { p = strings.slice(p, 0, len(p) - 1) }
+
+    let s = path
+    if s == "" { s = "/" }
+    if !strings.hasPrefix(s, "/") { s = "/" + s }
+
+    if p == "" { return s }
+    if s == "/" { return p }
+    return p + s
+}
+
+// ── HTML escaping ──────────────────────────────────────────────────────────
+
+// escapeHtml makes a string safe to interpolate into HTML text or a quoted
+// attribute. Used by the built-in error pages and the docs UI.
+fn escapeHtml(s: string): string {
+    let out = strings.replace(s, "&", "&amp;")
+    out = strings.replace(out, "<", "&lt;")
+    out = strings.replace(out, ">", "&gt;")
+    out = strings.replace(out, "\"", "&quot;")
+    out = strings.replace(out, "'", "&#39;")
+    return out
+}

@@ -1,0 +1,66 @@
+// realtime.goost — Server-Sent Events, WebSockets and static files.
+//
+//   ./langoost run examples/realtime.goost
+//   open http://localhost:8080
+//
+// Both streaming endpoints hold the connection open for as long as the
+// handler runs, and each connection has its own thread. Nothing here polls.
+
+import time
+import { newApp, res } from "../fastgoost"
+import { logger } from "../fastgoost/middleware.goost"
+
+let app = newApp({title: "Realtime", version: "1.0.0"})
+app.use(logger({skip: ["/assets"]}))
+
+// ── The page ───────────────────────────────────────────────────────────────
+
+let PAGE = "<!doctype html><meta charset=utf-8><title>fastgoost realtime</title>"
+PAGE = PAGE + "<style>body{font:14px ui-monospace,monospace;margin:2rem;max-width:40rem}"
+PAGE = PAGE + "h2{font-size:1rem;margin:1.5rem 0 .5rem}ul{padding-left:1.2rem;margin:0}"
+PAGE = PAGE + "li{list-style:none;margin:.15rem 0}input{font:inherit;width:70%}</style>"
+PAGE = PAGE + "<h1>fastgoost</h1>"
+PAGE = PAGE + "<h2>server-sent events</h2><ul id=sse></ul>"
+PAGE = PAGE + "<h2>websocket</h2><ul id=ws></ul><input id=msg placeholder='say something'>"
+PAGE = PAGE + "<script>"
+PAGE = PAGE + "const add=(el,t)=>{const li=document.createElement('li');li.textContent=t;"
+PAGE = PAGE + "document.getElementById(el).prepend(li)};"
+PAGE = PAGE + "new EventSource('/events').addEventListener('tick',e=>add('sse',e.data));"
+PAGE = PAGE + "const s=new WebSocket(`ws://${location.host}/ws`);"
+PAGE = PAGE + "s.onmessage=e=>add('ws',e.data);"
+PAGE = PAGE + "msg.onkeydown=e=>{if(e.key==='Enter'){s.send(msg.value);msg.value=''}};"
+PAGE = PAGE + "</script>"
+
+app.get("/", fn(req) { return res.html(PAGE) })
+
+// ── Server-Sent Events ─────────────────────────────────────────────────────
+//
+// The handler gets a Stream. It runs until it returns or the client goes
+// away, and `stream.alive` goes false as soon as a write fails — which is how
+// you notice a browser tab that was closed.
+
+app.sse("/events", fn(stream) {
+    stream.retry(2000)
+    let n = 0
+    while stream.alive && n < 60 {
+        n += 1
+        stream.sendJson("tick", {n: n, at: time.now()})
+        time.sleep(1000)
+    }
+})
+
+// ── WebSocket ──────────────────────────────────────────────────────────────
+//
+// The handler gets a Socket. recv() returns void when the peer closes, which
+// is the loop's exit condition.
+
+app.ws("/ws", fn(socket) {
+    socket.send("connected from " + socket.req.clientIp())
+    while true {
+        let message = socket.recv()
+        if typeof(message) == "void" { break }
+        socket.send("echo: " + message)
+    }
+})
+
+app.run(8080)

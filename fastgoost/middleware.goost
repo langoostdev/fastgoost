@@ -1,0 +1,428 @@
+// middleware.goost — the middleware that most applications end up writing.
+//
+//   import { newApp } from "fastgoost"
+//   import { logger, cors, requestId } from "fastgoost/middleware"
+//
+//   app.use(requestId())
+//   app.use(logger())
+//   app.use(cors({origins: ["https://example.com"]}))
+//
+// Every one of these is a function that *returns* the middleware, so the
+// configuration is closed over rather than looked up per request.
+//
+// A middleware is `fn(req, next)`. Call next(req) to continue and get the
+// response back; return something else to stop. Order matters: the first one
+// registered is the outermost, so it sees the final response of everything
+// inside it.
+
+import strings
+import time
+import terminal
+import { hmac } from "crypto"
+import { base64 } from "encode"
+import { isCallable, contains } from "./support.goost"
+import { json, text, httpError } from "./main.goost"
+
+// ── logger ─────────────────────────────────────────────────────────────────
+
+// logger writes one line per request: method, path, status and duration.
+//
+// Options:
+//   colour   bool     force colour on or off (default: on when stdout is a tty)
+//   skip     string[] path prefixes to stay quiet about — health checks,
+//                     static assets, anything that would drown the log
+fn logger(...opts): object {
+    let options = optionsOf(opts)
+
+    let coloured = false
+    try {
+        coloured = terminal.isatty()
+    } catch e {
+        coloured = false
+    }
+    if typeof(options.colour) == "bool" { coloured = options.colour }
+
+    let skip = []
+    if typeof(options.skip) == "array" { skip = options.skip }
+
+    return fn(req, next) {
+        let started = time.clock.unixMilli()
+        let resp = next(req)
+        for prefix in skip {
+            if strings.hasPrefix(req.path, prefix) { return resp }
+        }
+        let elapsed = time.clock.unixMilli() - started
+        let status = statusOf(resp)
+        let line = strings.padRight(req.method, 7, " ") + strings.padRight(req.path, 32, " ")
+        if coloured {
+            println(statusColour(status) + toString(status) + terminal.reset() + "  " + line + terminal.dim() + toString(elapsed) + "ms" + terminal.reset())
+        } else {
+            println(toString(status) + "  " + line + toString(elapsed) + "ms")
+        }
+        return resp
+    }
+}
+
+fn statusColour(status: int): string {
+    if status >= 500 { return terminal.color("red") }
+    if status >= 400 { return terminal.color("yellow") }
+    if status >= 300 { return terminal.color("cyan") }
+    return terminal.color("green")
+}
+
+// ── requestId ──────────────────────────────────────────────────────────────
+
+// requestId gives every request an id, on req.state.requestId and on the
+// response as X-Request-Id. An id the client supplied is kept, so a trace
+// started upstream survives the hop.
+//
+// Options: header (default "X-Request-Id"), trust (default true — accept the
+// client's id). Turn trust off at the edge of your system, where the value is
+// attacker-controlled and will end up in your logs.
+fn requestId(...opts): object {
+    let options = optionsOf(opts)
+    let header = "X-Request-Id"
+    if typeof(options.header) == "string" { header = options.header }
+    let trust = true
+    if typeof(options.trust) == "bool" { trust = options.trust }
+
+    let counter = {n: 0}
+
+    return fn(req, next) {
+        let id = ""
+        if trust { id = req.header(header) }
+        if id == "" {
+            counter.n += 1
+            id = toString(time.clock.unixMilli()) + "-" + toString(counter.n)
+        }
+        req.state.requestId = id
+        let resp = next(req)
+        return withHeader(resp, header, id)
+    }
+}
+
+// ── cors ───────────────────────────────────────────────────────────────────
+
+// cors answers preflight requests and adds the headers a browser needs before
+// it will hand a cross-origin response to JavaScript.
+//
+// Options:
+//   origins      string[]  allowed origins, or ["*"] (default ["*"])
+//   methods      string[]  default GET, POST, PUT, PATCH, DELETE, OPTIONS
+//   headers      string[]  allowed request headers (default: echo what was asked)
+//   expose       string[]  response headers JavaScript may read
+//   credentials  bool      allow cookies (default false)
+//   maxAge       int       how long a browser may cache the preflight, seconds
+//
+// `origins: ["*"]` together with `credentials: true` is rejected at startup
+// rather than at runtime: browsers refuse that combination, and a server that
+// sends it looks like it is working right up until a real request fails.
+fn cors(...opts): object {
+    let options = optionsOf(opts)
+
+    let origins = ["*"]
+    if typeof(options.origins) == "array" { origins = options.origins }
+    let credentials = false
+    if typeof(options.credentials) == "bool" { credentials = options.credentials }
+    if credentials && contains(origins, "*") {
+        throw {
+            kind:    "ConfigError",
+            message: "cors: credentials cannot be combined with origins [\"*\"] — browsers reject it; list the origins",
+        }
+    }
+
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    if typeof(options.methods) == "array" { methods = options.methods }
+    let allowHeaders = []
+    if typeof(options.headers) == "array" { allowHeaders = options.headers }
+    let expose = []
+    if typeof(options.expose) == "array" { expose = options.expose }
+    let maxAge = 600
+    if typeof(options.maxAge) == "int" { maxAge = options.maxAge }
+
+    return fn(req, next) {
+        let origin = req.header("Origin")
+        if origin == "" { return next(req) }
+
+        let allowed = ""
+        if contains(origins, "*") {
+            allowed = "*"
+        } else if contains(origins, origin) {
+            allowed = origin
+        }
+        if allowed == "" { return next(req) }        // not allowed: send nothing, the browser blocks it
+
+        // Preflight. Answer here; the route is never reached, which is the
+        // point — an OPTIONS probe should not run application code.
+        if req.method == "OPTIONS" && req.header("Access-Control-Request-Method") != "" {
+            let resp = text("", 204)
+            resp = resp.header("Access-Control-Allow-Origin", allowed)
+            resp = resp.header("Access-Control-Allow-Methods", strings.join(methods, ", "))
+            let requested = req.header("Access-Control-Request-Headers")
+            if len(allowHeaders) > 0 {
+                resp = resp.header("Access-Control-Allow-Headers", strings.join(allowHeaders, ", "))
+            } else if requested != "" {
+                resp = resp.header("Access-Control-Allow-Headers", requested)
+            }
+            resp = resp.header("Access-Control-Max-Age", toString(maxAge))
+            if credentials { resp = resp.header("Access-Control-Allow-Credentials", "true") }
+            if allowed != "*" { resp = resp.header("Vary", "Origin") }
+            return resp
+        }
+
+        let resp = withHeader(next(req), "Access-Control-Allow-Origin", allowed)
+        if credentials { resp = withHeader(resp, "Access-Control-Allow-Credentials", "true") }
+        if len(expose) > 0 { resp = withHeader(resp, "Access-Control-Expose-Headers", strings.join(expose, ", ")) }
+        if allowed != "*" { resp = withHeader(resp, "Vary", "Origin") }
+        return resp
+    }
+}
+
+// ── securityHeaders ────────────────────────────────────────────────────────
+
+// securityHeaders sets the small set of headers that cost nothing and close
+// off whole categories of attack: no MIME sniffing, no framing, no referrer
+// leakage across origins.
+//
+// Options: hsts (bool — only set this when you actually terminate TLS in
+// front, since a wrong HSTS header is remembered by browsers for a year),
+// csp (string), frameOptions (default "DENY"), referrerPolicy.
+fn securityHeaders(...opts): object {
+    let options = optionsOf(opts)
+    let frame = "DENY"
+    if typeof(options.frameOptions) == "string" { frame = options.frameOptions }
+    let referrer = "strict-origin-when-cross-origin"
+    if typeof(options.referrerPolicy) == "string" { referrer = options.referrerPolicy }
+
+    return fn(req, next) {
+        let resp = next(req)
+        resp = withHeader(resp, "X-Content-Type-Options", "nosniff")
+        resp = withHeader(resp, "X-Frame-Options", frame)
+        resp = withHeader(resp, "Referrer-Policy", referrer)
+        if typeof(options.csp) == "string" {
+            resp = withHeader(resp, "Content-Security-Policy", options.csp)
+        }
+        if typeof(options.hsts) == "bool" && options.hsts {
+            resp = withHeader(resp, "Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        }
+        return resp
+    }
+}
+
+// ── basicAuth ──────────────────────────────────────────────────────────────
+
+// basicAuth guards everything behind it with HTTP Basic credentials, and puts
+// the authenticated name on req.state.user.
+//
+// Options:
+//   users  object   name → password
+//   check  fn(name, password) → bool   for anything more than a fixed table
+//   realm  string   default "restricted"
+//
+// Password comparison is constant-time. A `==` on secrets leaks their length
+// and their common prefix to anyone who can measure the response.
+fn basicAuth(...opts): object {
+    let options = optionsOf(opts)
+    let users = {}
+    if typeof(options.users) == "object" { users = options.users }
+    let realm = "restricted"
+    if typeof(options.realm) == "string" { realm = options.realm }
+    let check = options.check
+
+    return fn(req, next) {
+        let header = req.header("Authorization")
+        if !strings.hasPrefix(strings.lower(header), "basic ") {
+            throw challenge(realm)
+        }
+        let decoded = ""
+        try {
+            decoded = base64.decode(strings.trim(strings.slice(header, 6, len(header))))
+        } catch e {
+            throw challenge(realm)
+        }
+        let colon = strings.indexOf(decoded, ":")
+        if colon < 0 { throw challenge(realm) }
+        let name = strings.slice(decoded, 0, colon)
+        let password = strings.slice(decoded, colon + 1, len(decoded))
+
+        let ok = false
+        if isCallable(check) {
+            ok = check(name, password)
+        } else {
+            let expected = users[name]
+            if typeof(expected) == "string" { ok = constantTimeEquals(expected, password) }
+        }
+        if !ok { throw challenge(realm) }
+
+        req.state.user = name
+        return next(req)
+    }
+}
+
+fn challenge(realm: string): object {
+    return httpError(401, "authentication required", {"WWW-Authenticate": "Basic realm=\"" + realm + "\""})
+}
+
+// constantTimeEquals compares two strings without an early exit. It still
+// reveals whether the lengths match, which is why it hashes first — both
+// digests are the same length whatever went in.
+fn constantTimeEquals(a: string, b: string): bool {
+    let left = hmac.sha256("fastgoost", a)
+    let right = hmac.sha256("fastgoost", b)
+    if len(left) != len(right) { return false }
+    let difference = 0
+    let i = 0
+    while i < len(left) {
+        if strings.byteAt(left, i) != strings.byteAt(right, i) { difference += 1 }
+        i += 1
+    }
+    return difference == 0
+}
+
+// ── rateLimit ──────────────────────────────────────────────────────────────
+
+// rateLimit caps how many requests one client may make in a window, answering
+// 429 with Retry-After once they are over it.
+//
+// Options:
+//   limit    int       requests per window (default 60)
+//   windowMs int       window length in milliseconds (default 60000)
+//   key      fn(req)   what counts as one client (default: req.clientIp())
+//
+// The counters live in this process's memory. Behind more than one instance
+// each gets its own budget, so the effective limit is the limit times the
+// number of instances — use a shared store (redis) when that matters.
+fn rateLimit(...opts): object {
+    let options = optionsOf(opts)
+    let limit = 60
+    if typeof(options.limit) == "int" { limit = options.limit }
+    let windowMs = 60000
+    if typeof(options.windowMs) == "int" { windowMs = options.windowMs }
+    let key = options.key
+
+    // One object shared by every request thread. Langoost gives a spawned
+    // thread its own copy of the *script's* globals but shares objects
+    // reachable through a closure, which is exactly what this needs.
+    let buckets = {}
+    let sweep = {at: 0}
+
+    return fn(req, next) {
+        let who = req.clientIp()
+        if isCallable(key) { who = toString(key(req)) }
+        if who == "" { who = "unknown" }
+
+        let now = time.clock.unixMilli()
+
+        // Drop expired buckets, at most once a window. Without this the map
+        // holds one entry per address ever seen, which for a public service is
+        // a memory leak with an attacker-controlled growth rate.
+        if now - sweep.at > windowMs {
+            sweep.at = now
+            for key in buckets {
+                if now >= buckets[key].resetAt { buckets[key] = nil }
+            }
+        }
+
+        let bucket = buckets[who]
+        if typeof(bucket) != "object" || now >= bucket.resetAt {
+            bucket = {count: 0, resetAt: now + windowMs}
+            buckets[who] = bucket
+        }
+        bucket.count += 1
+
+        let remaining = limit - bucket.count
+        if remaining < 0 { remaining = 0 }
+
+        if bucket.count > limit {
+            let retryAfter = (bucket.resetAt - now) / 1000
+            if retryAfter < 1 { retryAfter = 1 }
+            throw httpError(429, "rate limit exceeded", {
+                "Retry-After":           toString(retryAfter),
+                "X-RateLimit-Limit":     toString(limit),
+                "X-RateLimit-Remaining": "0",
+            })
+        }
+
+        let resp = next(req)
+        resp = withHeader(resp, "X-RateLimit-Limit", toString(limit))
+        return withHeader(resp, "X-RateLimit-Remaining", toString(remaining))
+    }
+}
+
+// ── timeout ────────────────────────────────────────────────────────────────
+
+// timing adds a Server-Timing header, which browsers show in the network
+// panel next to the transfer time. Useful for telling "the server was slow"
+// apart from "the network was slow" without leaving devtools.
+fn timing(...opts): object {
+    let options = optionsOf(opts)
+    let label = "app"
+    if typeof(options.label) == "string" { label = options.label }
+
+    return fn(req, next) {
+        let started = time.clock.unixMilli()
+        let resp = next(req)
+        let elapsed = time.clock.unixMilli() - started
+        return withHeader(resp, "Server-Timing", label + ";dur=" + toString(elapsed))
+    }
+}
+
+// ── enforceHttps ───────────────────────────────────────────────────────────
+
+// enforceHttps redirects plain HTTP to HTTPS, reading X-Forwarded-Proto,
+// which is what a reverse proxy in front sets. fastgoost never terminates TLS
+// itself, so this is only meaningful behind one.
+//
+// Options: host (default: the request's Host header), status (default 308).
+fn enforceHttps(...opts): object {
+    let options = optionsOf(opts)
+    let status = 308
+    if typeof(options.status) == "int" { status = options.status }
+
+    return fn(req, next) {
+        if req.isSecure() { return next(req) }
+        let host = req.header("Host")
+        if typeof(options.host) == "string" { host = options.host }
+        if host == "" { return next(req) }
+        let target = "https://" + host + req.url()
+        return text("", status).header("Location", target)
+    }
+}
+
+// ── Shared plumbing ────────────────────────────────────────────────────────
+
+// withHeader adds a header to whatever a downstream handler returned. A
+// handler is free to return a bare string or object — JSON and text only
+// become a Response on the way out — so a middleware that wants to add a
+// header has to promote the value first.
+fn withHeader(result, name: string, value: string) {
+    let resp = promote(result)
+    if typeof(resp) != "object" { return result }
+    return resp.header(name, value)
+}
+
+fn promote(result) {
+    if typeof(result) == "void" { return text("", 204) }
+    if result is Responder { return result.intoResponse() }
+    if typeof(result) == "string" { return text(result) }
+    return json(result)
+}
+
+// statusOf reads the status a result will be sent with, without changing it.
+fn statusOf(result): int {
+    if typeof(result) == "void" { return 204 }
+    if result is Responder {
+        let resp = result.intoResponse()
+        if typeof(resp.status) == "int" { return resp.status }
+    }
+    return 200
+}
+
+interface Responder {
+    fn intoResponse()
+}
+
+fn optionsOf(opts): object {
+    if len(opts) > 0 && typeof(opts[0]) == "object" { return opts[0] }
+    return {}
+}

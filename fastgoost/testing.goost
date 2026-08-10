@@ -1,0 +1,145 @@
+// testing.goost — drive an application without a socket.
+//
+//   import { newApp } from "fastgoost"
+//   import { request } from "fastgoost/testing"
+//   import { eq } from "assert"
+//
+//   fn test_creates_an_item() {
+//       let resp = request(app, "POST", "/items", {json: {title: "milk"}})
+//       eq(resp.status, 201)
+//       eq(resp.json().title, "milk")
+//   }
+//
+// The request goes through the whole pipeline — middleware, routing,
+// validation, dependencies, error handling — and stops just before the bytes
+// would hit a socket. No port to bind, nothing to tear down, and `langoost
+// test` can run the suite.
+
+import strings
+import { parse, stringify } from "json"
+import { headerMap, buildQuery } from "./httpx.goost"
+
+// Response is what request() hands back: the status, the headers as an object
+// keyed by lowercased name, and the body.
+class Response {
+    // json parses the body. Throws if the body is not JSON, which in a test
+    // is the failure you wanted anyway.
+    fn json() {
+        return parse(self.body)
+    }
+
+    // header reads one response header, case-insensitively. Absent is "".
+    fn header(name: string): string {
+        let value = self.headers[strings.lower(name)]
+        if typeof(value) != "string" { return "" }
+        return value
+    }
+
+    // cookie reads the value of a Set-Cookie by name, without its attributes.
+    fn cookie(name: string): string {
+        for line in self.rawHeaders {
+            if !strings.hasPrefix(strings.lower(line), "set-cookie:") { continue }
+            let value = strings.trim(strings.slice(line, 11, len(line)))
+            if !strings.hasPrefix(value, name + "=") { continue }
+            let rest = strings.slice(value, len(name) + 1, len(value))
+            let semi = strings.indexOf(rest, ";")
+            if semi >= 0 { return strings.slice(rest, 0, semi) }
+            return rest
+        }
+        return ""
+    }
+
+    // ok is true for any 2xx.
+    fn ok(): bool {
+        return self.status >= 200 && self.status < 300
+    }
+}
+
+// request runs one request against an application and returns the Response.
+//
+//   request(app, "GET", "/items")
+//   request(app, "GET", "/items", {query: {limit: 5}})
+//   request(app, "POST", "/items", {json: {title: "milk"}})
+//   request(app, "POST", "/login", {form: "user=ada&pass=x"})
+//   request(app, "GET", "/me", {headers: {Authorization: "Bearer abc"},
+//                               cookies: {session: "xyz"}})
+//
+// Options: query (object), json (any — encoded and typed as JSON), body
+// (string, sent verbatim), form (string, sent url-encoded), headers (object),
+// cookies (object), remoteAddr (string).
+fn request(app, method: string, target: string, ...opts) {
+    let options = {}
+    if len(opts) > 0 && typeof(opts[0]) == "object" { options = opts[0] }
+
+    let path = target
+    let rawQuery = ""
+    let mark = strings.indexOf(target, "?")
+    if mark >= 0 {
+        path = strings.slice(target, 0, mark)
+        rawQuery = strings.slice(target, mark + 1, len(target))
+    }
+    if typeof(options.query) == "object" {
+        let extra = buildQuery(options.query)
+        if extra != "" {
+            if rawQuery == "" { rawQuery = extra } else { rawQuery = rawQuery + "&" + extra }
+        }
+    }
+
+    let lines = []
+    let body = ""
+    if typeof(options.json) != "void" {
+        body = stringifyBody(options.json)
+        lines = append(lines, "Content-Type: application/json")
+    } else if typeof(options.form) == "string" {
+        body = options.form
+        lines = append(lines, "Content-Type: application/x-www-form-urlencoded")
+    } else if typeof(options.body) == "string" {
+        body = options.body
+    }
+
+    if typeof(options.headers) == "object" {
+        for name in options.headers {
+            lines = append(lines, name + ": " + toString(options.headers[name]))
+        }
+    }
+    if typeof(options.cookies) == "object" {
+        let pairs = []
+        for name in options.cookies {
+            pairs = append(pairs, name + "=" + toString(options.cookies[name]))
+        }
+        if len(pairs) > 0 { lines = append(lines, "Cookie: " + strings.join(pairs, "; ")) }
+    }
+    if body != "" { lines = append(lines, "Content-Length: " + toString(len(body))) }
+
+    let remoteAddr = "127.0.0.1:52000"
+    if typeof(options.remoteAddr) == "string" { remoteAddr = options.remoteAddr }
+
+    let wire = app.handle({
+        method:     strings.upper(method),
+        path:       path,
+        rawQuery:   rawQuery,
+        version:    "HTTP/1.1",
+        rawHeaders: lines,
+        headers:    headerMap(lines),
+        body:       body,
+        conn:       -1,
+        keepAlive:  false,
+        remoteAddr: remoteAddr,
+    })
+
+    let responseHeaders = []
+    if typeof(wire.rawHeaders) == "array" { responseHeaders = wire.rawHeaders }
+    return Response{
+        status:     wire.status,
+        headers:    headerMap(responseHeaders),
+        rawHeaders: responseHeaders,
+        body:       wire.body,
+    }
+}
+
+// stringifyBody encodes the `json` option, leaving an already-encoded string
+// alone so a test can send deliberately malformed JSON.
+fn stringifyBody(value): string {
+    if typeof(value) == "string" { return value }
+    return stringify(value)
+}

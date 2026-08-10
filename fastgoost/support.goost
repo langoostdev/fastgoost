@@ -1,0 +1,33 @@
+// support.goost — the handful of helpers that are not about HTTP at all and
+// that more than one module needs. Kept apart so no module has to import
+// another for something this small.
+//
+// Internal to fastgoost.
+
+// The framework's own version, shown in the startup panel.
+let VERSION = "1.0.0"
+
+// isCallable covers every shape a function value takes. typeof reports
+// "function" for a named declaration but "closure" for an anonymous one or
+// anything that captured a variable, and a handler is almost always the
+// second — checking for "function" alone rejects the common case.
+fn isCallable(value): bool {
+    let kind = typeof(value)
+    return kind == "function" || kind == "closure" || kind == "builtin"
+}
+
+// contains reports whether an array holds a value.
+fn contains(list, value): bool {
+    for item in list {
+        if item == value { return true }
+    }
+    return false
+}
+
+// concat joins two arrays into a new one, leaving both alone.
+fn concat(a, b) {
+    let out = []
+    for item in a { out = append(out, item) }
+    for item in b { out = append(out, item) }
+    return out
+}
