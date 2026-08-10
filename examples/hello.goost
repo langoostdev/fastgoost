@@ -1,0 +1,18 @@
+// hello.goost — the smallest thing that is still a web service.
+//
+//   ./langoost run examples/hello.goost
+//   curl localhost:8080/hello/ada
+//
+// Then open http://localhost:8080/docs.
+
+import { newApp } from "../fastgoost"
+
+let app = newApp({title: "Hello", version: "1.0.0"})
+
+// An object becomes JSON. A string becomes text/plain. That is the whole rule.
+app.get("/", fn(req) { return {message: "hello, world"} })
+
+// {name} captures one path segment; {id:int} captures and converts.
+app.get("/hello/{name}", fn(req) { return "hello, " + req.params.name })
+
+app.run(8080)

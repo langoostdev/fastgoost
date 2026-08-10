@@ -1,0 +1,9 @@
+{
+  "name": "fastgoost",
+  "version": "1.0.0",
+  "description": "A declarative web framework for Langoost: routing, validation, middleware, OpenAPI docs, SSE and WebSockets.",
+  "license": "MIT",
+  "keywords": ["web", "http", "framework", "api", "rest", "openapi", "websocket", "sse", "router", "middleware"],
+  "main": "fastgoost/main.goost",
+  "dependencies": {}
+}

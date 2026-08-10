@@ -1,0 +1,147 @@
+// auth.goost — dependencies, sessions and protecting routes.
+//
+//   ./langoost run examples/auth.goost
+//
+//   curl -X POST localhost:8080/login -H 'content-type: application/json' \
+//        -d '{"email":"ada@example.com","password":"lovelace"}' -c jar
+//   curl localhost:8080/me -b jar
+//   curl localhost:8080/me                         → 401
+//   curl -X DELETE localhost:8080/admin/users/2 -b jar   → 403, Ada is not an admin
+//
+// Two ideas worth separating:
+//
+//   middleware  runs for a group of routes and can answer instead of them
+//   deps        run for one route and hand the handler a value
+//
+// A dependency that throws stops the request, which is what makes `currentUser`
+// double as the authentication check: a route that declares it cannot run
+// without a signed-in user, and the handler never writes an `if` to prove it.
+
+import strings
+import os
+import { newApp, newRouter, res, err, Str } from "../fastgoost"
+import { logger, rateLimit } from "../fastgoost/middleware.goost"
+import { sign, verify } from "session"
+import { hmac } from "crypto"
+
+// ── Users ──────────────────────────────────────────────────────────────────
+//
+// Passwords are stored as salted HMAC digests. A real service would use a
+// slow KDF — this is the shape, not the recommendation.
+
+let SECRET = secretFromEnv()
+
+fn secretFromEnv(): string {
+    let value = os.getenv("SESSION_SECRET")
+    if typeof(value) == "string" && value != "" { return value }
+    // Fine for an example, wrong for anything else: a fixed secret means
+    // anyone who has read this file can mint a session cookie.
+    println("SESSION_SECRET is unset — using the example's fixed key")
+    return "example-key-do-not-ship"
+}
+
+fn digest(password: string): string {
+    return hmac.sha256(SECRET, password)
+}
+
+let users = {
+    "1": {id: 1, email: "ada@example.com",  name: "Ada",  role: "user",  password: digest("lovelace")},
+    "2": {id: 2, email: "alan@example.com", name: "Alan", role: "admin", password: digest("turing")},
+}
+
+fn userByEmail(email: string) {
+    for id in users {
+        if users[id].email == strings.lower(email) { return users[id] }
+    }
+    return nil
+}
+
+fn publicUser(user): object {
+    return {id: user.id, email: user.email, name: user.name, role: user.role}
+}
+
+// ── Dependencies ───────────────────────────────────────────────────────────
+//
+// A dependency is fn(req) → value. Its result lands on req.deps under the name
+// the route gave it. Throwing from one rejects the request before the handler.
+
+fn currentUser(req) {
+    let token = req.cookie("session")
+    if token == "" { token = req.bearer() }
+    if token == "" { throw err.unauthorized("sign in first") }
+
+    let payload = verify(token, SECRET)
+    if typeof(payload) != "string" { throw err.unauthorized("session expired or tampered with") }
+
+    let user = users[payload]
+    if typeof(user) != "object" { throw err.unauthorized("no such account") }
+    return user
+}
+
+fn adminOnly(req) {
+    let user = currentUser(req)
+    if user.role != "admin" { throw err.forbidden("admins only") }
+    return user
+}
+
+// ── Routes ─────────────────────────────────────────────────────────────────
+
+let app = newApp({title: "Auth", version: "1.0.0"})
+app.use(logger())
+
+let Credentials = {email: Str({minLength: 3}), password: Str({minLength: 1})}
+
+app.post("/login", {
+    handler:    login,
+    body:       Credentials,
+    summary:    "Exchange credentials for a session cookie",
+    middleware: [rateLimit({limit: 10, windowMs: 60000})],
+})
+
+fn login(req) {
+    let user = userByEmail(req.data.email)
+    // Same answer for "no such user" and "wrong password": telling them apart
+    // turns the login form into a way to enumerate accounts.
+    if typeof(user) != "object" || user.password != digest(req.data.password) {
+        throw err.unauthorized("wrong email or password")
+    }
+    let token = sign(toString(user.id), SECRET)
+    return res.cookieWith("session", token, {maxAge: 86400, sameSite: "Lax"}).json(publicUser(user))
+}
+
+app.post("/logout", fn(req) {
+    return res.clearCookie("session").noContent()
+})
+
+app.get("/me", {
+    handler: fn(req) { return publicUser(req.deps.user) },
+    deps:    {user: currentUser},
+    summary: "The signed-in account",
+})
+
+// ── An admin group ─────────────────────────────────────────────────────────
+//
+// Every route on this router requires an admin, declared once.
+
+let admin = newRouter("/admin", {tags: ["admin"]})
+
+admin.get("/users", {handler: listUsers, deps: {admin: adminOnly}, summary: "List accounts"})
+admin.delete("/users/{id:int}", {handler: removeUser, deps: {admin: adminOnly}, status: 204, summary: "Delete an account"})
+
+fn listUsers(req) {
+    let out = []
+    for id in users { out = append(out, publicUser(users[id])) }
+    return out
+}
+
+fn removeUser(req) {
+    let target = users[toString(req.params.id)]
+    if typeof(target) != "object" { throw err.notFound("no such account") }
+    if target.id == req.deps.admin.id { throw err.conflict("you cannot delete yourself") }
+    users[toString(req.params.id)] = nil
+    return res.noContent()
+}
+
+app.include(admin)
+
+app.run(8080)

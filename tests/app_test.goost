@@ -1,0 +1,333 @@
+// app_test.goost — the request pipeline end to end, without a socket.
+//
+// Every test here builds an application, sends it a request through
+// fastgoost/testing, and looks at what comes back — the same path a real
+// request takes, minus the bytes.
+
+import { eq, ok } from "assert"
+import { newApp, newRouter, res, err, abort, Str, Int, Bool, List } from "../fastgoost"
+import { request } from "../fastgoost/testing.goost"
+
+fn blankApp() {
+    return newApp({title: "Test", version: "1.0.0", docs: false})
+}
+
+// ── Results become responses ───────────────────────────────────────────────
+
+fn test_an_object_becomes_json() {
+    let app = blankApp()
+    app.get("/", fn(req) { return {a: 1} })
+    let resp = request(app, "GET", "/")
+    eq(resp.status, 200)
+    eq(resp.header("content-type"), "application/json")
+    eq(resp.json().a, 1)
+}
+
+fn test_a_string_becomes_text() {
+    let app = blankApp()
+    app.get("/", fn(req) { return "hello" })
+    let resp = request(app, "GET", "/")
+    eq(resp.body, "hello")
+    eq(resp.header("content-type"), "text/plain; charset=utf-8")
+}
+
+fn test_nothing_becomes_204() {
+    let app = blankApp()
+    app.get("/", fn(req) { return })
+    eq(request(app, "GET", "/").status, 204)
+}
+
+fn test_the_reply_builder_composes() {
+    let app = blankApp()
+    app.get("/", fn(req) {
+        return res.status(201).header("Location", "/x").cookie("sid", "abc").json({ok: true})
+    })
+    let resp = request(app, "GET", "/")
+    eq(resp.status, 201)
+    eq(resp.header("location"), "/x")
+    eq(resp.cookie("sid"), "abc")
+    ok(resp.json().ok)
+}
+
+fn test_a_route_can_declare_its_success_status() {
+    let app = blankApp()
+    app.post("/", {handler: fn(req) { return {made: true} }, status: 201})
+    eq(request(app, "POST", "/").status, 201)
+}
+
+// ── Routing ────────────────────────────────────────────────────────────────
+
+fn test_path_parameters_arrive_converted() {
+    let app = blankApp()
+    app.get("/u/{id:int}", fn(req) { return {id: req.params.id, kind: typeof(req.params.id)} })
+    eq(request(app, "GET", "/u/7").json().id, 7)
+    eq(request(app, "GET", "/u/7").json().kind, "int")
+    eq(request(app, "GET", "/u/seven").status, 404)
+}
+
+fn test_the_most_specific_route_wins() {
+    let app = blankApp()
+    // Registered least-specific first, on purpose.
+    app.get("/files/{name}", fn(req) { return "param" })
+    app.get("/files/latest", fn(req) { return "literal" })
+    eq(request(app, "GET", "/files/latest").body, "literal")
+    eq(request(app, "GET", "/files/other").body, "param")
+}
+
+fn test_a_known_path_with_an_unknown_method_is_405() {
+    let app = blankApp()
+    app.get("/only-get", fn(req) { return "x" })
+    let resp = request(app, "DELETE", "/only-get")
+    eq(resp.status, 405)
+    ok(resp.header("allow") != "")
+}
+
+fn test_an_unknown_path_is_404() {
+    eq(request(blankApp(), "GET", "/nowhere").status, 404)
+}
+
+fn test_head_follows_get_without_a_body() {
+    let app = blankApp()
+    app.get("/", fn(req) { return "body text" })
+    let resp = request(app, "HEAD", "/")
+    eq(resp.status, 200)
+}
+
+fn test_options_reports_what_the_path_allows() {
+    let app = blankApp()
+    app.get("/thing", fn(req) { return "x" })
+    app.post("/thing", fn(req) { return "y" })
+    let resp = request(app, "OPTIONS", "/thing")
+    eq(resp.status, 204)
+    ok(resp.header("allow") != "")
+}
+
+fn test_a_trailing_slash_is_the_same_path() {
+    let app = blankApp()
+    app.get("/items", fn(req) { return "list" })
+    eq(request(app, "GET", "/items/").body, "list")
+}
+
+// ── Validation ─────────────────────────────────────────────────────────────
+
+fn test_a_bad_body_is_422_and_never_reaches_the_handler() {
+    let reached = {yes: false}
+    let app = blankApp()
+    app.post("/", {handler: fn(req) { reached.yes = true; return {} },
+                   body: {title: Str({minLength: 3})}})
+    let resp = request(app, "POST", "/", {json: {title: "x"}})
+    eq(resp.status, 422)
+    ok(!reached.yes)
+    eq(resp.json().detail[0].loc[1], "title")
+}
+
+fn test_a_good_body_arrives_on_req_data_with_defaults_applied() {
+    let app = blankApp()
+    app.post("/", {handler: fn(req) { return req.data },
+                   body: {title: Str(), done: Bool({default: false}), tags: List(Str(), {default: []})}})
+    let body = request(app, "POST", "/", {json: {title: "milk"}}).json()
+    eq(body.title, "milk")
+    eq(body.done, false)
+    eq(len(body.tags), 0)
+}
+
+fn test_query_parameters_are_validated_and_typed() {
+    let app = blankApp()
+    app.get("/s", {handler: fn(req) { return {limit: req.query.limit, kind: typeof(req.query.limit)} },
+                   query: {limit: Int({default: 10, max: 100})}})
+    eq(request(app, "GET", "/s").json().limit, 10)
+    eq(request(app, "GET", "/s", {query: {limit: 5}}).json().kind, "int")
+    eq(request(app, "GET", "/s", {query: {limit: 999}}).status, 422)
+}
+
+fn test_a_form_body_satisfies_the_same_schema_as_json() {
+    let app = blankApp()
+    app.post("/", {handler: fn(req) { return req.data }, body: {name: Str({minLength: 1})}})
+    eq(request(app, "POST", "/", {form: "name=Ada"}).json().name, "Ada")
+}
+
+fn test_malformed_json_is_400_not_500() {
+    let app = blankApp()
+    app.post("/", {handler: fn(req) { return req.json() }})
+    eq(request(app, "POST", "/", {json: "{not json"}).status, 400)
+}
+
+// ── Middleware ─────────────────────────────────────────────────────────────
+
+fn test_middleware_wraps_the_handler_in_order() {
+    let order = []
+    let app = blankApp()
+    app.use(fn(req, next) { order.push("outer in"); let r = next(req); order.push("outer out"); return r })
+    app.use(fn(req, next) { order.push("inner in"); let r = next(req); order.push("inner out"); return r })
+    app.get("/", fn(req) { order.push("handler"); return "x" })
+    request(app, "GET", "/")
+    eq(order[0], "outer in")
+    eq(order[1], "inner in")
+    eq(order[2], "handler")
+    eq(order[3], "inner out")
+    eq(order[4], "outer out")
+}
+
+fn test_middleware_can_answer_instead_of_the_handler() {
+    let app = blankApp()
+    app.use(fn(req, next) { return res.status(503).text("closed") })
+    app.get("/", fn(req) { return "never" })
+    let resp = request(app, "GET", "/")
+    eq(resp.status, 503)
+    eq(resp.body, "closed")
+}
+
+fn test_global_middleware_sees_a_404_too() {
+    let seen = {count: 0}
+    let app = blankApp()
+    app.use(fn(req, next) { seen.count += 1; return next(req) })
+    eq(request(app, "GET", "/nowhere").status, 404)
+    eq(seen.count, 1)
+}
+
+fn test_route_middleware_applies_only_to_that_route() {
+    let app = blankApp()
+    let tag = fn(req, next) { req.state.tagged = true; return next(req) }
+    app.get("/tagged", {handler: fn(req) { return {tagged: req.state.tagged} }, middleware: [tag]})
+    app.get("/plain", fn(req) { return {tagged: req.state.tagged} })
+    eq(request(app, "GET", "/tagged").json().tagged, true)
+    eq(typeof(request(app, "GET", "/plain").json().tagged), "void")
+}
+
+// ── Dependencies ───────────────────────────────────────────────────────────
+
+fn test_a_dependency_result_lands_on_req_deps() {
+    let app = blankApp()
+    app.get("/", {handler: fn(req) { return {who: req.deps.user} },
+                  deps: {user: fn(req) { return "ada" }}})
+    eq(request(app, "GET", "/").json().who, "ada")
+}
+
+fn test_a_dependency_that_throws_stops_the_request() {
+    let reached = {yes: false}
+    let app = blankApp()
+    app.get("/", {handler: fn(req) { reached.yes = true; return "x" },
+                  deps: {user: fn(req) { throw err.unauthorized("no") }}})
+    eq(request(app, "GET", "/").status, 401)
+    ok(!reached.yes)
+}
+
+// ── Errors ─────────────────────────────────────────────────────────────────
+
+fn test_abort_and_the_error_builder_set_the_status() {
+    let app = blankApp()
+    app.get("/a", fn(req) { abort(404, "gone fishing") })
+    app.get("/b", fn(req) { throw err.conflict("already there") })
+    eq(request(app, "GET", "/a").status, 404)
+    eq(request(app, "GET", "/a").json().detail, "gone fishing")
+    eq(request(app, "GET", "/b").status, 409)
+}
+
+fn test_an_error_handler_can_replace_the_response() {
+    let app = blankApp()
+    app.onError(404, fn(req, error) { return res.status(404).text("nothing at " + req.path) })
+    eq(request(app, "GET", "/missing").body, "nothing at /missing")
+}
+
+fn test_an_unexpected_error_is_500_and_leaks_nothing() {
+    let app = blankApp()
+    app.get("/", fn(req) { throw {message: "database password is hunter2"} })
+    let resp = request(app, "GET", "/")
+    eq(resp.status, 500)
+    eq(resp.json().detail, "Internal Server Error")
+}
+
+// ── Routers ────────────────────────────────────────────────────────────────
+
+fn test_a_router_mounts_under_its_prefix() {
+    let app = blankApp()
+    let users = newRouter("/users")
+    users.get("/{id:int}", fn(req) { return {id: req.params.id} })
+    app.include(users)
+    eq(request(app, "GET", "/users/3").json().id, 3)
+    eq(request(app, "GET", "/3").status, 404)
+}
+
+fn test_router_middleware_folds_into_its_routes_only() {
+    let app = blankApp()
+    let guarded = newRouter("/g")
+    guarded.use(fn(req, next) { req.state.guarded = true; return next(req) })
+    guarded.get("/x", fn(req) { return {guarded: req.state.guarded} })
+    app.get("/open", fn(req) { return {guarded: req.state.guarded} })
+    app.include(guarded)
+    eq(request(app, "GET", "/g/x").json().guarded, true)
+    eq(typeof(request(app, "GET", "/open").json().guarded), "void")
+}
+
+fn test_mount_adds_a_further_prefix() {
+    let app = blankApp()
+    let v1 = newRouter("/users")
+    v1.get("", fn(req) { return "users" })
+    app.mount("/api/v1", v1)
+    eq(request(app, "GET", "/api/v1/users").body, "users")
+}
+
+fn test_url_for_builds_a_path_from_a_named_route() {
+    let app = blankApp()
+    app.get("/users/{id:int}/posts/{slug}", {handler: fn(req) { return "x" }, name: "post"})
+    eq(app.urlFor("post", {id: 7, slug: "hello"}), "/users/7/posts/hello")
+}
+
+// ── Request helpers ────────────────────────────────────────────────────────
+
+fn test_request_reads_headers_cookies_and_the_query() {
+    let app = blankApp()
+    app.get("/r", fn(req) {
+        return {
+            agent:  req.header("user-agent"),
+            token:  req.bearer(),
+            cookie: req.cookie("sid"),
+            q:      req.q("a"),
+            fallb:  req.qOr("missing", "default"),
+            url:    req.url(),
+        }
+    })
+    let resp = request(app, "GET", "/r?a=1", {
+        headers: {"User-Agent": "probe", Authorization: "Bearer tok"},
+        cookies: {sid: "s1"},
+    })
+    let body = resp.json()
+    eq(body.agent, "probe")
+    eq(body.token, "tok")
+    eq(body.cookie, "s1")
+    eq(body.q, "1")
+    eq(body.fallb, "default")
+    eq(body.url, "/r?a=1")
+}
+
+// ── OpenAPI ────────────────────────────────────────────────────────────────
+
+fn test_the_spec_describes_declared_routes() {
+    let app = newApp({title: "Spec", version: "2.0.0"})
+    app.post("/items", {handler: fn(req) { return {} },
+                        summary: "Create", tags: ["items"], status: 201,
+                        body:  {title: Str({minLength: 1})},
+                        query: {dry: Bool({default: false})}})
+    let doc = app.openapi()
+    eq(doc.info.title, "Spec")
+    eq(doc.info.version, "2.0.0")
+    let op = doc.paths["/items"].post
+    eq(op.summary, "Create")
+    eq(op.tags[0], "items")
+    eq(op.parameters[0].name, "dry")
+    eq(op.requestBody.content["application/json"].schema.required[0], "title")
+    ok(typeof(op.responses["422"]) == "object")   // validation is declared, so 422 is documented
+}
+
+fn test_hidden_routes_stay_out_of_the_spec() {
+    let app = newApp({title: "Spec", version: "1.0.0"})
+    app.get("/health", {handler: fn(req) { return "ok" }, hidden: true})
+    eq(typeof(app.openapi().paths["/health"]), "void")
+}
+
+fn test_the_spec_and_docs_are_served() {
+    let app = newApp({title: "Spec", version: "1.0.0"})
+    app.get("/", fn(req) { return "x" })
+    eq(request(app, "GET", "/openapi.json").status, 200)
+    eq(request(app, "GET", "/docs").header("content-type"), "text/html; charset=utf-8")
+}

@@ -1,0 +1,388 @@
+// server.goost — the HTTP/1.1 connection loop.
+//
+// fastgoost does not sit on the built-in `http_server` module. It needs the
+// raw socket: keep-alive, streaming responses, Server-Sent Events and the
+// WebSocket upgrade all require holding a connection open past a single
+// request/response pair, and `http_server.serve` closes after one.
+//
+// What this speaks: HTTP/1.1 and HTTP/1.0, keep-alive with pipelining off,
+// Content-Length and chunked request bodies, `Expect: 100-continue`, and HEAD.
+// What it does not: TLS (put a reverse proxy in front), HTTP/2 (the `http2`
+// module has that), request pipelining, chunked *responses* other than the
+// hijacked ones SSE writes by hand.
+//
+// Internal to fastgoost.
+
+import net
+import strings
+import thread
+import { statusText, headerMap } from "./httpx.goost"
+import { isCallable } from "./support.goost"
+
+let DEFAULT_IDLE_MS      = 30000        // how long a kept-alive socket may sit silent
+let DEFAULT_HEADER_MS    = 10000        // deadline for the request line plus headers
+let DEFAULT_MAX_BODY     = 8388608      // 8 MiB
+let DEFAULT_MAX_HEADERS  = 100
+let DEFAULT_MAX_LINE     = 8192
+let READ_CHUNK           = 65536
+let DEFAULT_MAX_CONNS    = 512          // 0 disables the cap
+
+// ── The accept loop ────────────────────────────────────────────────────────
+
+// listen binds a port and serves it until the process ends.
+//
+// `onRequest` is called once per request with the raw request object and must
+// return a wire response: {status: int, rawHeaders: string[], body: string}.
+// Returning {hijacked: true} instead tells the loop that the handler has taken
+// the socket over — the loop stops reading and lets the connection go.
+//
+// Blocks forever. Run it inside thread.core.spawn to do anything else.
+fn listen(host: string, port: int, opts: object, onRequest) {
+    let listener = net.listen(host, port)
+    if listener < 0 {
+        throw {
+            kind:    "ListenError",
+            message: "cannot bind " + host + ":" + toString(port) + " — is something already using it?",
+        }
+    }
+
+    let config = withDefaults(opts)
+    let ready = config.onReady
+    if isCallable(ready) { ready(port) }
+
+    // A permit per in-flight connection. Without one, a client that opens
+    // sockets faster than handlers close them spawns threads without bound —
+    // the accept loop is the only place with the standing to say no.
+    let permits = 0
+    if config.maxConnections > 0 { permits = thread.semaphore.new(config.maxConnections) }
+
+    while true {
+        let conn = net.accept(listener)
+        if conn < 0 { continue }
+        if permits > 0 { thread.semaphore.acquire(permits) }
+        // One thread per connection. The closure captures conn and config at
+        // the spawn site, so concurrent requests never see each other's state.
+        thread.core.spawn(fn() {
+            serveConnection(conn, config, onRequest)
+            if permits > 0 { thread.semaphore.release(permits) }
+        })
+    }
+}
+
+fn withDefaults(opts: object): object {
+    let config = {
+        idleTimeoutMs:   DEFAULT_IDLE_MS,
+        headerTimeoutMs: DEFAULT_HEADER_MS,
+        maxBodyBytes:    DEFAULT_MAX_BODY,
+        maxHeaders:      DEFAULT_MAX_HEADERS,
+        keepAlive:       true,
+        maxConnections:  DEFAULT_MAX_CONNS,
+        serverHeader:    "fastgoost",
+        onReady:         nil,
+    }
+    if typeof(opts) != "object" { return config }
+    for key in opts {
+        if typeof(opts[key]) != "void" { config[key] = opts[key] }
+    }
+    return config
+}
+
+// ── One connection ─────────────────────────────────────────────────────────
+
+// serveConnection runs the request/response cycle until the peer goes away,
+// either side asks to close, or something goes wrong enough to stop trusting
+// the byte stream.
+fn serveConnection(conn: int, config: object, onRequest) {
+    let alive = true
+    while alive {
+        net.setTimeout(conn, config.idleTimeoutMs)
+        let requestLine = net.recvLine(conn)
+        if requestLine == "" { break }              // peer closed, or went silent
+
+        net.setTimeout(conn, config.headerTimeoutMs)
+        let req = readRequest(conn, requestLine, config)
+
+        if typeof(req.fatal) == "object" {
+            writeResponse(conn, req.fatal, "GET", false, config)
+            break
+        }
+
+        // The handler may take arbitrarily long and may stream; no deadline.
+        net.setTimeout(conn, 0)
+
+        let wantsKeepAlive = config.keepAlive && req.keepAlive
+        let resp = {}
+        try {
+            resp = onRequest(req)
+        } catch e {
+            resp = {status: 500, rawHeaders: [], body: "Internal Server Error"}
+            wantsKeepAlive = false
+        }
+
+        if typeof(resp) == "object" && typeof(resp.hijacked) == "bool" && resp.hijacked {
+            break                                    // SSE or WebSocket owns the socket now
+        }
+
+        let ok = writeResponse(conn, resp, req.method, wantsKeepAlive, config)
+        alive = ok && wantsKeepAlive
+    }
+    net.close(conn)
+}
+
+// ── Reading a request ──────────────────────────────────────────────────────
+
+// readRequest parses one request off the wire. On malformed input it returns
+// an object carrying `fatal`, a ready-made error response, rather than
+// guessing at what the client meant.
+fn readRequest(conn: int, requestLine: string, config: object): object {
+    let parts = strings.split(requestLine, " ")
+    if len(parts) < 3 {
+        return {fatal: errorResponse(400, "Malformed request line")}
+    }
+    let method = parts[0]
+    let target = parts[1]
+    let version = parts[2]
+
+    let path = target
+    let rawQuery = ""
+    let mark = strings.indexOf(target, "?")
+    if mark >= 0 {
+        path = strings.slice(target, 0, mark)
+        rawQuery = strings.slice(target, mark + 1, len(target))
+    }
+    // An absolute-form target ("GET http://host/path") is legal for proxies.
+    if strings.hasPrefix(strings.lower(path), "http://") || strings.hasPrefix(strings.lower(path), "https://") {
+        let scheme = strings.indexOf(path, "://")
+        let slash = strings.indexOf(strings.slice(path, scheme + 3, len(path)), "/")
+        if slash >= 0 {
+            path = strings.slice(path, scheme + 3 + slash, len(path))
+        } else {
+            path = "/"
+        }
+    }
+    if path == "" { path = "/" }
+
+    let rawHeaders = []
+    while true {
+        let line = net.recvLine(conn)
+        if line == "" { break }
+        if len(rawHeaders) >= config.maxHeaders {
+            return {fatal: errorResponse(431, "Too many header fields")}
+        }
+        if len(line) > DEFAULT_MAX_LINE {
+            return {fatal: errorResponse(431, "Header field too long")}
+        }
+        rawHeaders = append(rawHeaders, line)
+    }
+
+    let headers = headerMap(rawHeaders)
+    let keepAlive = shouldKeepAlive(version, headers)
+
+    // "Expect: 100-continue" — acknowledge before the client sends the body.
+    let expect = headers["expect"]
+    if typeof(expect) == "string" && strings.lower(expect) == "100-continue" {
+        net.send(conn, "HTTP/1.1 100 Continue\r\n\r\n")
+    }
+
+    let body = ""
+    let encoding = headers["transfer-encoding"]
+    if typeof(encoding) == "string" && strings.contains(strings.lower(encoding), "chunked") {
+        let chunked = readChunkedBody(conn, config.maxBodyBytes)
+        if typeof(chunked.fatal) == "object" { return chunked }
+        body = chunked.body
+    } else {
+        let declared = headers["content-length"]
+        if typeof(declared) == "string" && declared != "" {
+            let length = parseLength(declared)
+            if length < 0 {
+                return {fatal: errorResponse(400, "Invalid Content-Length")}
+            }
+            if length > config.maxBodyBytes {
+                return {fatal: errorResponse(413, "Request body too large")}
+            }
+            body = readExact(conn, length)
+            if len(body) < length {
+                return {fatal: errorResponse(400, "Request body ended early")}
+            }
+        }
+    }
+
+    return {
+        method:     strings.upper(method),
+        path:       path,
+        rawQuery:   rawQuery,
+        version:    version,
+        rawHeaders: rawHeaders,
+        headers:    headers,
+        body:       body,
+        conn:       conn,
+        keepAlive:  keepAlive,
+        remoteAddr: net.remoteAddr(conn),
+    }
+}
+
+// shouldKeepAlive: persistent by default on HTTP/1.1, opt-in on HTTP/1.0.
+fn shouldKeepAlive(version: string, headers: object): bool {
+    let connection = ""
+    if typeof(headers["connection"]) == "string" { connection = strings.lower(headers["connection"]) }
+    if strings.contains(connection, "close") { return false }
+    if strings.hasPrefix(strings.upper(version), "HTTP/1.0") {
+        return strings.contains(connection, "keep-alive")
+    }
+    return true
+}
+
+// readExact loops until it has n bytes or the peer stops sending.
+fn readExact(conn: int, n: int): string {
+    let out = ""
+    let remaining = n
+    while remaining > 0 {
+        let want = remaining
+        if want > READ_CHUNK { want = READ_CHUNK }
+        let chunk = net.recv(conn, want)
+        if len(chunk) == 0 { return out }
+        out = out + chunk
+        remaining = remaining - len(chunk)
+    }
+    return out
+}
+
+// readChunkedBody reassembles a `Transfer-Encoding: chunked` body, enforcing
+// the size cap across the whole body rather than per chunk — otherwise the
+// cap would be trivially bypassed by sending many small chunks.
+fn readChunkedBody(conn: int, maxBytes: int): object {
+    let body = ""
+    while true {
+        let header = net.recvLine(conn)
+        if header == "" { return {fatal: errorResponse(400, "Truncated chunked body")} }
+        let semi = strings.indexOf(header, ";")
+        if semi >= 0 { header = strings.slice(header, 0, semi) }
+        let size = parseHex(strings.trim(header))
+        if size < 0 { return {fatal: errorResponse(400, "Invalid chunk size")} }
+        if size == 0 { break }
+        if len(body) + size > maxBytes {
+            return {fatal: errorResponse(413, "Request body too large")}
+        }
+        let chunk = readExact(conn, size)
+        if len(chunk) < size { return {fatal: errorResponse(400, "Truncated chunk")} }
+        body = body + chunk
+        net.recvLine(conn)                 // the CRLF that ends the chunk
+    }
+    // Trailing headers, if any, run to a blank line.
+    while true {
+        let trailer = net.recvLine(conn)
+        if trailer == "" { break }
+    }
+    return {body: body}
+}
+
+fn parseLength(raw: string): int {
+    let value = strings.trim(raw)
+    if value == "" { return -1 }
+    let i = 0
+    while i < len(value) {
+        let b = strings.byteAt(value, i)
+        if b < 48 || b > 57 { return -1 }
+        i += 1
+    }
+    try { return toInt(value) } catch e { return -1 }
+}
+
+fn parseHex(raw: string): int {
+    if raw == "" { return -1 }
+    let total = 0
+    let i = 0
+    while i < len(raw) {
+        let b = strings.byteAt(raw, i)
+        let digit = -1
+        if b >= 48 && b <= 57  { digit = b - 48 }
+        if b >= 97 && b <= 102 { digit = b - 87 }
+        if b >= 65 && b <= 70  { digit = b - 55 }
+        if digit < 0 { return -1 }
+        total = total * 16 + digit
+        i += 1
+    }
+    return total
+}
+
+// ── Writing a response ─────────────────────────────────────────────────────
+
+// writeResponse serialises a wire response. Returns false when the socket has
+// gone, so the caller knows not to keep the connection around.
+//
+// Content-Length is always computed here rather than trusted from the handler:
+// a mismatch between the declared length and the bytes actually written is how
+// a keep-alive connection turns into a request-smuggling bug.
+fn writeResponse(conn: int, resp, method: string, keepAlive: bool, config: object): bool {
+    let status = 200
+    let body = ""
+    let extra = []
+
+    if typeof(resp) == "object" {
+        if typeof(resp.status) == "int" { status = resp.status }
+        if typeof(resp.body) == "string" { body = resp.body }
+        if typeof(resp.rawHeaders) == "array" { extra = resp.rawHeaders }
+    }
+
+    let bodyless = status == 204 || status == 304 || (status >= 100 && status < 200)
+    if bodyless { body = "" }
+
+    let out = "HTTP/1.1 " + toString(status) + " " + statusText(status) + "\r\n"
+    for line in extra {
+        if !strings.hasPrefix(strings.lower(line), "content-length:") {
+            if !strings.hasPrefix(strings.lower(line), "connection:") {
+                out = out + line + "\r\n"
+            }
+        }
+    }
+    if !bodyless {
+        out = out + "Content-Length: " + toString(len(body)) + "\r\n"
+    }
+    if typeof(config.serverHeader) == "string" && config.serverHeader != "" {
+        out = out + "Server: " + config.serverHeader + "\r\n"
+    }
+    if keepAlive {
+        out = out + "Connection: keep-alive\r\n"
+    } else {
+        out = out + "Connection: close\r\n"
+    }
+    out = out + "\r\n"
+
+    // A HEAD response carries the headers a GET would, and no body at all.
+    if method == "HEAD" || bodyless {
+        return net.send(conn, out)
+    }
+    if len(body) == 0 {
+        return net.send(conn, out)
+    }
+    return net.send(conn, out + body)
+}
+
+fn errorResponse(status: int, message: string): object {
+    return {
+        status:     status,
+        rawHeaders: ["Content-Type: text/plain; charset=utf-8"],
+        body:       message + "\n",
+    }
+}
+
+// spawn runs a function on its own thread. Re-exported so the rest of the
+// framework does not each have to import `thread` for the one call.
+fn spawn(work) {
+    thread.core.spawn(work)
+}
+
+// ── Hijacking ──────────────────────────────────────────────────────────────
+
+// hijacked is the marker a handler returns after taking the socket over. The
+// connection loop stops touching the stream and closes it once the handler
+// has finished.
+fn hijacked(): object {
+    return {hijacked: true}
+}
+
+// sendRaw writes straight to the socket, for handlers that stream their own
+// bytes. Returns false once the peer has gone.
+fn sendRaw(conn: int, data: string): bool {
+    return net.send(conn, data)
+}

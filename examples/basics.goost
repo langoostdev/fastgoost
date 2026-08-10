@@ -1,0 +1,176 @@
+// basics.goost — everything a handler can read off a request, one route each.
+//
+//   ./langoost run examples/basics.goost
+//
+// Path parameters, query strings, JSON bodies, form posts, headers, cookies
+// and file uploads. Every route below has the curl line that exercises it.
+
+import { newApp, res, err, Str, Int, Bool, List, Obj } from "../fastgoost"
+import { logger } from "../fastgoost/middleware.goost"
+
+let app = newApp({title: "Basics", version: "1.0.0"})
+app.use(logger())
+
+// ── 1. Path parameters ─────────────────────────────────────────────────────
+//
+//   curl localhost:8080/users/7
+//   curl localhost:8080/users/seven        → 404, "seven" is not an int
+//   curl localhost:8080/files/a/b/c.txt
+//
+// {id:int} converts as it matches. A segment that is not an integer does not
+// match the route at all, so the handler never sees a string where it asked
+// for a number. Converters: int, float, bool, str, path.
+
+app.get("/users/{id:int}", fn(req) {
+    return {id: req.params.id, kind: typeof(req.params.id)}
+})
+
+app.get("/files/{rest:path}", fn(req) {
+    return {path: req.params.rest}                 // "path" swallows the slashes
+})
+
+// ── 2. Query parameters, undeclared ────────────────────────────────────────
+//
+//   curl "localhost:8080/echo?q=hello&tag=a&tag=b&flag"
+//
+// req.query is always there, always strings. A repeated key becomes an array;
+// a bare key becomes "". req.q(name) is the same thing with "" for absent,
+// and req.qOr(name, fallback) supplies your own default.
+
+app.get("/echo", fn(req) {
+    return {
+        all:      req.query,
+        q:        req.q("q"),
+        page:     req.qOr("page", "1"),
+        missing:  req.q("nope"),
+    }
+})
+
+// ── 3. Query parameters, declared ──────────────────────────────────────────
+//
+//   curl "localhost:8080/search?q=goost&limit=5&sort=new&tag=a&tag=b"
+//   curl "localhost:8080/search?q=goost&limit=999"     → 422
+//   curl "localhost:8080/search?limit=5"               → 422, q is required
+//
+// Declaring the query does three things at once: it rejects bad input with a
+// 422 before the handler runs, it converts what survives (limit is an int,
+// paid is a bool), and it fills in /docs. req.query is the validated object.
+
+let SearchQuery = {
+    q:     Str({minLength: 1, description: "What to search for"}),
+    limit: Int({default: 10, min: 1, max: 100}),
+    sort:  Str({default: "relevance", enum: ["relevance", "new", "old"]}),
+    paid:  Bool({default: false}),
+    tag:   List(Str(), {default: [], description: "Repeat to pass several"}),
+}
+
+app.get("/search", {handler: search, query: SearchQuery, summary: "Search things"})
+
+fn search(req) {
+    return {
+        term:   req.query.q,                        // string
+        limit:  req.query.limit,                    // int, already converted
+        sort:   req.query.sort,                     // one of the enum
+        paid:   req.query.paid,                     // bool
+        tags:   req.query.tag,                      // array, even for one value
+        types:  [typeof(req.query.limit), typeof(req.query.paid), typeof(req.query.tag)],
+    }
+}
+
+// ── 4. POST with a JSON body ───────────────────────────────────────────────
+//
+//   curl -X POST localhost:8080/signup -H 'content-type: application/json' \
+//        -d '{"email":"ada@example.com","password":"correct horse","age":36}'
+//
+//   curl -X POST localhost:8080/signup -H 'content-type: application/json' \
+//        -d '{"email":"nope","password":"x"}'          → 422, three problems at once
+//
+// The declared body is parsed, validated and converted into req.data. The
+// handler starts from a value it can trust. Note `status: 201` — the route
+// says what a success looks like, so the handler just returns the object.
+
+let Signup = {
+    email:    Str({pattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", description: "Where to reach you"}),
+    password: Str({minLength: 8, maxLength: 200}),
+    age:      Int({required: false, min: 13, max: 130}),
+    profile:  Obj({name: Str({required: false}), site: Str({required: false})}, {required: false}),
+}
+
+app.post("/signup", {handler: signup, body: Signup, status: 201, summary: "Create an account"})
+
+fn signup(req) {
+    return {created: req.data.email, age: req.data.age, profile: req.data.profile}
+}
+
+// ── 5. POST without a declared body ────────────────────────────────────────
+//
+//   curl -X POST localhost:8080/raw -H 'content-type: application/json' -d '{"any":"shape"}'
+//   curl -X POST localhost:8080/raw -d 'not json'      → 400
+//
+// req.json() parses on demand and throws 400 on malformed JSON. req.body is
+// the bytes exactly as they arrived.
+
+app.post("/raw", fn(req) {
+    return {parsed: req.json(), bytes: len(req.body)}
+})
+
+// ── 6. POST from an HTML form ──────────────────────────────────────────────
+//
+//   curl -X POST localhost:8080/contact -d 'name=Ada&message=hello+there'
+//
+// A declared body accepts url-encoded and multipart forms as readily as JSON,
+// so the same route serves a browser form and an API client. req.form() is
+// the undeclared equivalent, returning {fields, files}.
+
+let Contact = {name: Str({minLength: 1}), message: Str({minLength: 1, maxLength: 5000})}
+
+app.post("/contact", {handler: contact, body: Contact, summary: "Send a message"})
+
+fn contact(req) {
+    return {thanks: req.data.name, length: len(req.data.message)}
+}
+
+//   curl -X POST localhost:8080/upload -F 'note=hi' -F 'file=@README.md'
+app.post("/upload", fn(req) {
+    let form = req.form()
+    let names = []
+    for name in form.files { names = append(names, name) }
+    return {fields: form.fields, files: names}
+})
+
+// ── 7. Headers ─────────────────────────────────────────────────────────────
+//
+//   curl localhost:8080/whoami -H 'Authorization: Bearer abc123' -H 'X-Trace: t-1'
+
+app.get("/whoami", fn(req) {
+    return {
+        agent:  req.header("User-Agent"),           // case-insensitive
+        token:  req.bearer(),                       // "" when absent
+        trace:  req.header("X-Trace"),
+        ip:     req.clientIp(),
+        secure: req.isSecure(),
+        wants:  req.accepts("application/json"),
+    }
+})
+
+// ── 8. Cookies ─────────────────────────────────────────────────────────────
+//
+//   curl -i localhost:8080/visit
+//   curl -i --cookie 'visits=3' localhost:8080/visit
+
+app.get("/visit", fn(req) {
+    let seen = req.cookie("visits")
+    let count = 1
+    if seen != "" { count = toInt(seen) + 1 }
+    return res.cookieWith("visits", toString(count), {maxAge: 86400}).json({visits: count})
+})
+
+// ── 9. Answering with something other than JSON ────────────────────────────
+
+app.get("/page",     fn(req) { return res.html("<h1>a page</h1>") })
+app.get("/plain",    fn(req) { return "just text" })
+app.get("/nothing",  fn(req) { return res.noContent() })
+app.get("/elsewhere",fn(req) { return res.redirect("/page") })
+app.get("/teapot",   fn(req) { throw err.status(418, "I'm a teapot") })
+
+app.run(8080)

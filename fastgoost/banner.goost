@@ -1,0 +1,227 @@
+// banner.goost — the startup panel.
+//
+// Three renderings of the same information, chosen by what is on the other
+// end of stdout:
+//
+//   a terminal          box drawing, colour, sized to the window
+//   a narrow terminal   the same, with the summary column dropped
+//   a pipe or a file    plain ASCII, no escapes, nothing to strip out of logs
+//
+// The last one is the point. A startup banner that writes escape codes into
+// a log file is a banner that makes the log harder to read, and `isatty` is
+// the whole test needed to avoid it.
+//
+// Internal to fastgoost.
+
+import strings
+import terminal
+import { VERSION } from "./support.goost"
+
+let MIN_WIDTH = 48
+let MAX_WIDTH = 100
+
+// show prints the panel for a running application.
+fn show(app, host: string, port: int) {
+    let shown = host
+    if shown == "0.0.0.0" { shown = "localhost" }
+    if shown == "::" { shown = "localhost" }
+    let base = "http://" + shown + ":" + toString(port)
+
+    let pretty = isTTY()
+    let width = panelWidth(app, base, pretty)
+
+    if !pretty {
+        showPlain(app, base)
+        return
+    }
+
+    let dim = terminal.dim()
+    let bold = terminal.bold()
+    let reset = terminal.reset()
+    let accent = terminal.color("cyan")
+
+    println("")
+    println(dim + "╭" + repeat("─", width) + "╮" + reset)
+    line(dim, reset, width, bold + "fastgoost" + reset + dim + " " + VERSION + reset,
+         len("fastgoost " + VERSION))
+    line(dim, reset, width, bold + app.info.title + reset + dim + "  " + app.info.version + reset,
+         len(app.info.title + "  " + app.info.version))
+    line(dim, reset, width, "", 0)
+    line(dim, reset, width, accent + base + reset, len(base))
+    if app.info.docs && app.info.docsUrl != "" {
+        let docs = base + app.info.docsUrl
+        line(dim, reset, width, accent + docs + reset + dim + "  docs" + reset, len(docs + "  docs"))
+    }
+
+    let rows = routeRows(app)
+    if len(rows) > 0 {
+        println(dim + "├" + repeat("─", width) + "┤" + reset)
+        let patternWidth = columnWidth(rows)
+        for row in rows {
+            let plain = pad(row.method, 7) + pad(row.pattern, patternWidth)
+            let painted = methodColour(row.method) + pad(row.method, 7) + reset + pad(row.pattern, patternWidth)
+            let summary = fit(row.summary, width - len(plain) - 2)
+            if summary != "" {
+                painted = painted + dim + summary + reset
+                plain = plain + summary
+            }
+            line(dim, reset, width, painted, len(plain))
+        }
+    }
+    println(dim + "╰" + repeat("─", width) + "╯" + reset)
+    println("")
+}
+
+// line prints one row of the box. `visible` is the width the content occupies
+// on screen — it cannot be derived from the string, because colour escapes
+// have length but no width.
+fn line(dim: string, reset: string, width: int, content: string, visible: int) {
+    // The row is two leading spaces, the content, then filler. `width` counts
+    // the characters between the borders, which is what the rules above and
+    // below span.
+    let gap = width - visible - 2
+    if gap < 0 { gap = 0 }
+    println(dim + "│" + reset + "  " + content + repeat(" ", gap) + dim + "│" + reset)
+}
+
+fn showPlain(app, base: string) {
+    println("")
+    println("fastgoost " + VERSION + " — " + app.info.title + " " + app.info.version)
+    println("listening on " + base)
+    if app.info.docs && app.info.docsUrl != "" {
+        println("docs at " + base + app.info.docsUrl)
+    }
+    let rows = routeRows(app)
+    if len(rows) > 0 {
+        println("")
+        let patternWidth = columnWidth(rows)
+        for row in rows {
+            let text = "  " + pad(row.method, 8) + pad(row.pattern, patternWidth)
+            if row.summary != "" { text = text + row.summary }
+            println(strings.trimRight(text, " "))
+        }
+    }
+    println("")
+}
+
+// ── Rows ───────────────────────────────────────────────────────────────────
+
+// routeRows flattens the route table into what the panel shows: the badge,
+// the pattern, and whatever summary the route declared.
+// routeRows lists the routes in the order a reader wants them — grouped by
+// path — rather than the order the dispatcher wants them, which is by
+// specificity and looks arbitrary on screen.
+fn routeRows(app): object[] {
+    let rows = []
+    for route in app.routes {
+        if route.hidden { continue }
+        let row = {method: badge(route), pattern: route.pattern, summary: route.summary}
+        let at = 0
+        while at < len(rows) && sortsBefore(rows[at], row) { at += 1 }
+        rows = insertAt(rows, at, row)
+    }
+    return rows
+}
+
+fn sortsBefore(a, b): bool {
+    if a.pattern != b.pattern { return a.pattern < b.pattern }
+    return a.method < b.method
+}
+
+fn insertAt(rows, index: int, row): object[] {
+    let out = []
+    let i = 0
+    while i < len(rows) {
+        if i == index { out = append(out, row) }
+        out = append(out, rows[i])
+        i += 1
+    }
+    if index >= len(rows) { out = append(out, row) }
+    return out
+}
+
+// badge names the protocol when it is not plain HTTP, because "GET /events"
+// hides the fact that /events never returns.
+fn badge(route): string {
+    if route.protocol == "sse" { return "SSE" }
+    if route.protocol == "ws" { return "WS" }
+    return route.method
+}
+
+fn methodColour(method: string): string {
+    if method == "GET"    { return terminal.color("green") }
+    if method == "POST"   { return terminal.color("yellow") }
+    if method == "PUT"    { return terminal.color("yellow") }
+    if method == "PATCH"  { return terminal.color("yellow") }
+    if method == "DELETE" { return terminal.color("red") }
+    if method == "SSE"    { return terminal.color("magenta") }
+    if method == "WS"     { return terminal.color("magenta") }
+    return terminal.color("blue")
+}
+
+fn columnWidth(rows): int {
+    let widest = 0
+    for row in rows {
+        let n = len(row.pattern)
+        if n > widest { widest = n }
+    }
+    return widest + 2
+}
+
+// ── Measuring ──────────────────────────────────────────────────────────────
+
+fn panelWidth(app, base: string, pretty: bool): int {
+    let widest = len("fastgoost " + VERSION)
+    let title = len(app.info.title + "  " + app.info.version)
+    if title > widest { widest = title }
+    if len(base) + 6 > widest { widest = len(base) + 6 }
+
+    let rows = routeRows(app)
+    let patternWidth = columnWidth(rows)
+    for row in rows {
+        let n = 7 + patternWidth + len(row.summary)
+        if n > widest { widest = n }
+    }
+
+    let width = widest + 4
+    if width < MIN_WIDTH { width = MIN_WIDTH }
+
+    let ceiling = MAX_WIDTH
+    if pretty {
+        let cols = terminal.size().cols
+        if cols > 0 && cols - 2 < ceiling { ceiling = cols - 2 }
+    }
+    if width > ceiling { width = ceiling }
+    if width < MIN_WIDTH { width = MIN_WIDTH }
+    return width
+}
+
+// isTTY answers whether stdout is a terminal. Anything that goes wrong asking
+// is treated as "no" — plain output is never the wrong answer.
+fn isTTY(): bool {
+    try {
+        return terminal.isatty()
+    } catch e {
+        return false
+    }
+}
+
+// ── Text ───────────────────────────────────────────────────────────────────
+
+fn pad(text: string, width: int): string {
+    if len(text) >= width { return text + " " }
+    return text + repeat(" ", width - len(text))
+}
+
+// fit truncates to the space available, with an ellipsis when it has to cut.
+// A negative or tiny budget yields "" rather than a stub.
+fn fit(text: string, budget: int): string {
+    if text == "" || budget < 4 { return "" }
+    if len(text) <= budget { return text }
+    return strings.slice(text, 0, budget - 1) + "…"
+}
+
+fn repeat(unit: string, count: int): string {
+    if count <= 0 { return "" }
+    return strings.repeat(unit, count)
+}

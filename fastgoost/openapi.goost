@@ -1,0 +1,304 @@
+// openapi.goost — turns a route table into an OpenAPI 3.1 document, and
+// serves the two documentation UIs that read it.
+//
+// The point of declaring `query`, `body` and `responses` on a route is that
+// one declaration does three jobs: it validates the request, it documents the
+// endpoint, and it tells a client generator what to emit. This module is the
+// second and third of those.
+//
+// Internal to fastgoost.
+
+import strings
+import { escapeHtml } from "./httpx.goost"
+import { isSpec, specKind, isRequired } from "./validate.goost"
+import { contains } from "./support.goost"
+
+fn document(info: object, routes): object {
+    let paths = {}
+    let tagNames = []
+
+    for route in routes {
+        if route.hidden { continue }
+        if route.protocol != "http" { continue }
+        if route.method == "HEAD" { continue }
+
+        let key = openapiPath(route.pattern)
+        if typeof(paths[key]) == "void" { paths[key] = {} }
+        let item = paths[key]
+        item[strings.lower(route.method)] = operation(route)
+
+        for tag in route.tags {
+            if !contains(tagNames, tag) { tagNames = append(tagNames, tag) }
+        }
+    }
+
+    let tags = []
+    for name in tagNames { tags = append(tags, {name: name}) }
+
+    let doc = {
+        openapi: "3.1.0",
+        info: infoBlock(info),
+        paths: paths,
+    }
+    if len(tags) > 0 { doc.tags = tags }
+    if typeof(info.servers) == "array" && len(info.servers) > 0 { doc.servers = info.servers }
+    return doc
+}
+
+fn infoBlock(info): object {
+    let out = {title: info.title, version: info.version}
+    if typeof(info.description) == "string" && info.description != "" {
+        out.description = info.description
+    }
+    return out
+}
+
+// operation describes one method on one path.
+fn operation(route): object {
+    let op = {
+        operationId: route.operationId,
+        responses:   responses(route),
+    }
+    if route.summary != ""     { op.summary = route.summary }
+    if route.description != "" { op.description = route.description }
+    if len(route.tags) > 0     { op.tags = route.tags }
+
+    let params = []
+    for param in route.pathParams {
+        params = append(params, {
+            name:     param.name,
+            "in":     "path",
+            required: true,
+            schema:   schemaForConverter(param.conv),
+        })
+    }
+    if typeof(route.query) == "object" {
+        for name in route.query {
+            let spec = route.query[name]
+            params = append(params, {
+                name:        name,
+                "in":        "query",
+                required:    isRequired(spec),
+                description: describe(spec),
+                schema:      jsonSchema(spec),
+            })
+        }
+    }
+    if typeof(route.headers) == "object" {
+        for name in route.headers {
+            let spec = route.headers[name]
+            params = append(params, {
+                name:        name,
+                "in":        "header",
+                required:    isRequired(spec),
+                description: describe(spec),
+                schema:      jsonSchema(spec),
+            })
+        }
+    }
+    if len(params) > 0 { op.parameters = params }
+
+    if typeof(route.body) == "object" {
+        let content = {}
+        content["application/json"] = {schema: bodySchema(route.body)}
+        op.requestBody = {required: true, content: content}
+    }
+    return op
+}
+
+// responses merges whatever the route declared with the ones the framework
+// itself can produce, so a 422 shows up wherever validation is configured.
+fn responses(route): object {
+    let out = {}
+    if typeof(route.responses) == "object" {
+        for code in route.responses {
+            let declared = route.responses[code]
+            if typeof(declared) == "string" {
+                out[code] = {description: declared}
+            } else {
+                out[code] = declared
+            }
+        }
+    }
+    if typeof(out["200"]) == "void" && typeof(out["201"]) == "void" && typeof(out["204"]) == "void" {
+        out["200"] = {description: "Successful response"}
+    }
+    if typeof(route.body) == "object" || typeof(route.query) == "object" {
+        if typeof(out["422"]) == "void" {
+            let content = {}
+            content["application/json"] = {schema: validationErrorSchema()}
+            out["422"] = {description: "Validation error", content: content}
+        }
+    }
+    return out
+}
+
+// ── Schemas ────────────────────────────────────────────────────────────────
+
+// bodySchema accepts either a single spec or a field map, matching what the
+// validator accepts.
+fn bodySchema(schema): object {
+    if isSpec(schema) { return jsonSchema(schema) }
+    return objectSchema(schema)
+}
+
+fn objectSchema(fields): object {
+    let properties = {}
+    let required = []
+    for name in fields {
+        let spec = fields[name]
+        if isSpec(spec) {
+            properties[name] = jsonSchema(spec)
+            if isRequired(spec) { required = append(required, name) }
+        } else {
+            properties[name] = objectSchema(spec)
+            required = append(required, name)
+        }
+    }
+    let out = {}
+    out["type"] = "object"
+    out.properties = properties
+    if len(required) > 0 { out.required = required }
+    return out
+}
+
+// jsonSchema translates one validation spec into its JSON Schema equivalent.
+fn jsonSchema(spec): object {
+    let out = {}
+    let kind = specKind(spec)
+
+    if kind == "int" {
+        out["type"] = "integer"
+    } else if kind == "float" || kind == "number" {
+        out["type"] = "number"
+    } else if kind == "bool" {
+        out["type"] = "boolean"
+    } else if kind == "str" || kind == "string" {
+        out["type"] = "string"
+    } else if kind == "array" {
+        out["type"] = "array"
+        if typeof(spec.items) == "object" { out.items = jsonSchema(spec.items) }
+    } else if kind == "object" {
+        if typeof(spec.fields) == "object" { return objectSchema(spec.fields) }
+        out["type"] = "object"
+    }
+
+    if typeof(spec.description) == "string" { out.description = spec.description }
+    if typeof(spec.default) != "void"       { out.default = spec.default }
+    if typeof(spec.example) != "void"       { out.example = spec.example }
+    if typeof(spec.enum) == "array"         { out.enum = spec.enum }
+    if typeof(spec.pattern) == "string"     { out.pattern = spec.pattern }
+    if typeof(spec.min) == "int" || typeof(spec.min) == "float" { out.minimum = spec.min }
+    if typeof(spec.max) == "int" || typeof(spec.max) == "float" { out.maximum = spec.max }
+    if typeof(spec.minLength) == "int" {
+        if kind == "array" { out.minItems = spec.minLength } else { out.minLength = spec.minLength }
+    }
+    if typeof(spec.maxLength) == "int" {
+        if kind == "array" { out.maxItems = spec.maxLength } else { out.maxLength = spec.maxLength }
+    }
+    return out
+}
+
+fn schemaForConverter(conv: string): object {
+    let out = {}
+    if conv == "int" {
+        out["type"] = "integer"
+    } else if conv == "float" {
+        out["type"] = "number"
+    } else if conv == "bool" {
+        out["type"] = "boolean"
+    } else {
+        out["type"] = "string"
+    }
+    return out
+}
+
+fn validationErrorSchema(): object {
+    let loc = {}
+    loc["type"] = "array"
+    loc.items = {}
+
+    let msg = {}
+    msg["type"] = "string"
+
+    let kind = {}
+    kind["type"] = "string"
+
+    let detailItem = {}
+    detailItem["type"] = "object"
+    detailItem.properties = {loc: loc, msg: msg}
+    detailItem.properties["type"] = kind
+
+    let detail = {}
+    detail["type"] = "array"
+    detail.items = detailItem
+
+    let out = {}
+    out["type"] = "object"
+    out.properties = {detail: detail}
+    return out
+}
+
+fn describe(spec) {
+    if typeof(spec) != "object" { return }
+    return spec.description
+}
+
+// openapiPath rewrites a fastgoost pattern into OpenAPI's placeholder syntax:
+// converters are dropped ({id:int} → {id}) and a bare wildcard is named.
+fn openapiPath(pattern: string): string {
+    let out = []
+    for seg in strings.split(pattern, "/") {
+        if seg == "*" {
+            out = append(out, "{path}")
+        } else if strings.hasPrefix(seg, "{") && strings.hasSuffix(seg, "}") {
+            let inner = strings.slice(seg, 1, len(seg) - 1)
+            let colon = strings.indexOf(inner, ":")
+            if colon >= 0 { inner = strings.slice(inner, 0, colon) }
+            out = append(out, "{" + inner + "}")
+        } else {
+            out = append(out, seg)
+        }
+    }
+    let joined = strings.join(out, "/")
+    if joined == "" { return "/" }
+    return joined
+}
+
+// ── Documentation UIs ──────────────────────────────────────────────────────
+
+// swaggerHtml renders the interactive Swagger UI page. The assets come from a
+// CDN, so /docs needs the browser to have internet access even when the API
+// itself is local — the alternative is vendoring a megabyte of JavaScript into
+// the package. The spec at specUrl is served by your own process either way.
+fn swaggerHtml(title: string, specUrl: string): string {
+    let safeTitle = escapeHtml(title)
+    let safeSpec = escapeHtml(specUrl)
+    let out = "<!doctype html>\n<html lang=\"en\">\n<head>\n"
+    out = out + "<meta charset=\"utf-8\">\n"
+    out = out + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    out = out + "<title>" + safeTitle + " \u2014 API docs</title>\n"
+    out = out + "<link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\">\n"
+    out = out + "<style>body{margin:0;background:#fafafa}</style>\n"
+    out = out + "</head>\n<body>\n<div id=\"swagger-ui\"></div>\n"
+    out = out + "<script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js\"></script>\n"
+    out = out + "<script>\nwindow.ui = SwaggerUIBundle({url: \"" + safeSpec + "\", "
+    out = out + "dom_id: \"#swagger-ui\", deepLinking: true, tryItOutEnabled: true});\n</script>\n"
+    return out + "</body>\n</html>\n"
+}
+
+// redocHtml renders the read-only ReDoc page — narrower feature set, much
+// better for reading a large API top to bottom.
+fn redocHtml(title: string, specUrl: string): string {
+    let safeTitle = escapeHtml(title)
+    let safeSpec = escapeHtml(specUrl)
+    let out = "<!doctype html>\n<html lang=\"en\">\n<head>\n"
+    out = out + "<meta charset=\"utf-8\">\n"
+    out = out + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    out = out + "<title>" + safeTitle + " \u2014 API reference</title>\n"
+    out = out + "<style>body{margin:0}</style>\n"
+    out = out + "</head>\n<body>\n"
+    out = out + "<redoc spec-url=\"" + safeSpec + "\"></redoc>\n"
+    out = out + "<script src=\"https://cdn.redocly.com/redoc/latest/bundles/redoc.standalone.js\"></script>\n"
+    return out + "</body>\n</html>\n"
+}
